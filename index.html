@@ -7,7 +7,7 @@
   <title>MailPolish 邮件润色</title>
   <!-- 微软 Office.js（Outlook 插件必须从微软官方地址加载） -->
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-  <link rel="stylesheet" href="app.css">
+  <link rel="stylesheet" href="app.css?v=1.1.0">
   <link rel="icon" href="icon-32.png">
 </head>
 <body>
@@ -97,6 +97,7 @@
           </div>
           <button id="btnRewrite" class="btn primary block">生成改写</button>
           <p class="hint">可以直接用中文写意思，选中后点「生成改写」，会写成英文。</p>
+          <div id="rewriteMsg"></div>
           <div id="rewriteResults"></div>
         </section>
       </div>
@@ -120,13 +121,23 @@
           <label class="lbl" for="model">模型</label>
           <select id="model" class="input"></select>
         </div>
-        <div class="field">
-          <label class="lbl" for="variant">英语习惯</label>
-          <select id="variant" class="input">
-            <option value="US">美式英语</option>
-            <option value="UK">英式英语</option>
-          </select>
+        <div class="field two">
+          <div>
+            <label class="lbl" for="variant">英语习惯</label>
+            <select id="variant" class="input">
+              <option value="US">美式英语</option>
+              <option value="UK">英式英语</option>
+            </select>
+          </div>
+          <div>
+            <label class="lbl" for="replaceMode">替换方式</label>
+            <select id="replaceMode" class="input">
+              <option value="direct">一键直接替换</option>
+              <option value="confirm">有图片时先确认</option>
+            </select>
+          </div>
         </div>
+        <p class="hint">一键直接替换：替换后会自动检查，图片变少就恢复原样。有图片时先确认：更稳妥，但要多点一下。</p>
         <div class="field">
           <label class="lbl" for="about">关于你（让 AI 的用词更贴合你的工作）</label>
           <textarea id="about" class="input" rows="3" placeholder="例如：I work in supply chain at a frozen seafood importer. I email overseas suppliers and the distribution centers of US retail customers."></textarea>
@@ -162,6 +173,7 @@
           <b>隐私提示：</b>检查时会把你正在写的句子、邮件主题、以及对方来信的开头部分发送给 AI 服务。DeepSeek 的隐私政策写明数据在中国境内处理和存储，请确认这符合公司规定。
         </div>
         <div id="usageDetail" class="muted small mt"></div>
+        <div id="versionInfo" class="muted small mt"></div>
         <div class="row gap mt">
           <button id="btnSave" class="btn primary" type="button">保存</button>
           <button id="btnCloseSettings" class="btn" type="button">返回</button>
@@ -177,10 +189,10 @@
     </aside>
   </div>
 
-  <script src="textutil.js"></script>
-  <script src="ai.js"></script>
-  <script src="host.js"></script>
-  <script src="manifest.js"></script>
-  <script src="app.js"></script>
+  <script src="textutil.js?v=1.1.0"></script>
+  <script src="ai.js?v=1.1.0"></script>
+  <script src="host.js?v=1.1.0"></script>
+  <script src="manifest.js?v=1.1.0"></script>
+  <script src="app.js?v=1.1.0"></script>
 </body>
 </html>

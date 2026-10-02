@@ -4,11 +4,12 @@
  *  - OutlookHost：装进 Outlook 后，通过微软 Office.js 读写正在编辑的邮件
  *  - StandaloneHost：直接用浏览器打开网页时，读写页面上的文本框（用来试用/测试）
  *
- * 替换一句话的策略（从安全到方便）：
- *  1. 如果你在邮件里选中的正好是这句话 → 只替换选中内容（最安全，不动其它内容）
+ * 替换一句话的策略：
+ *  1. 如果你在邮件里选中的正好是这句话 → 只替换选中内容（不动其它内容）
  *  2. 否则在 HTML 正文里精确定位这句话，只改动不同的那几个字，再写回正文
  *     （微软接口限制：写回正文后光标会跳动；经典版 Outlook 不能用 Ctrl+Z 撤销，所以我们自己记录撤销）
- *  3. 正文里有图片（如签名 logo）时，第 2 步需要你确认，因为整段写回时图片可能受影响
+ *  3. 写回后立刻读回检查：图片变少或文字大量丢失 → 自动恢复原样，并报告失败
+ *  4. 设置为「有图片时先确认」时，正文有图片会先返回 has_images，由界面询问用户
  */
 (function (root) {
   'use strict';
@@ -32,6 +33,34 @@
       }
     });
   }
+
+  function countImages(html) {
+    return (String(html || '').match(/<img\b/gi) || []).length;
+  }
+
+  /** 撤销记录（两种宿主共用） */
+  const undoMethods = {
+    pushUndo(entry) {
+      this.undoStack.push(entry);
+      if (this.undoStack.length > 30) this.undoStack.shift();
+      return entry;
+    },
+    removeUndo(entry) {
+      const i = this.undoStack.lastIndexOf(entry);
+      if (i >= 0) this.undoStack.splice(i, 1);
+    },
+    canUndo() { return this.undoStack.length > 0; },
+    lastUndo() { return this.undoStack[this.undoStack.length - 1] || null; },
+    /** 撤销某一次替换：把新文字换回原文（不会丢掉你之后写的其它内容） */
+    async revertEntry(entry, opts) {
+      if (!entry) return { ok: false, reason: 'empty' };
+      const r = await this.replaceSentence(entry.replacement, entry.original, Object.assign({}, opts, { record: false }));
+      if (r.ok) this.removeUndo(entry);
+      return r;
+    },
+    async undo(opts) { return this.revertEntry(this.lastUndo(), opts); },
+    reset() { this.undoStack = []; }
+  };
 
   class OutlookHost {
     constructor() {
@@ -82,50 +111,52 @@
     }
 
     /**
-     * 把 original 这句话改成 replacement。
-     * 返回 { ok, method: 'selection' | 'body' } 或 { ok:false, reason }
+     * 把 original 改成 replacement。
+     * opts.allowFullBody：正文有图片时也允许写回整个正文（一键替换模式）
+     * opts.record：是否记入撤销记录（默认记）
+     * 返回 { ok, method: 'selection' | 'body', entry } 或 { ok:false, reason }
      */
     async replaceSentence(original, replacement, opts) {
-      const allowFullBody = !!(opts && opts.allowFullBody);
+      const o = opts || {};
+      const record = o.record !== false;
       let sel = '';
       try { sel = await this.getSelectedText(); } catch (e) { sel = ''; }
       if (sel && TU.normalize(sel) === TU.normalize(original)) {
         await this.replaceSelection(replacement);
-        this.pushUndo({ original, replacement, method: 'selection' });
-        return { ok: true, method: 'selection' };
+        return { ok: true, method: 'selection', entry: record ? this.pushUndo({ original, replacement, method: 'selection' }) : null };
       }
       const html = await this.getBodyHtml();
-      if (!allowFullBody && /<img\b/i.test(html)) return { ok: false, reason: 'has_images' };
+      if (!o.allowFullBody && countImages(html) > 0) return { ok: false, reason: 'has_images' };
       const r = TU.replaceInHtml(html, original, replacement);
       if (!r.ok) return r;
-      if (!r.unchanged) await this.setBodyHtml(r.html);
-      this.pushUndo({ original, replacement, method: 'body' });
-      return { ok: true, method: 'body' };
+      if (!r.unchanged) {
+        await this.setBodyHtml(r.html);
+        const check = await this.verifyAfterWrite(html, original, replacement);
+        if (!check.ok) return check;
+      }
+      return { ok: true, method: 'body', entry: record ? this.pushUndo({ original, replacement, method: 'body' }) : null };
     }
-
-    pushUndo(entry) {
-      this.undoStack.push(entry);
-      if (this.undoStack.length > 20) this.undoStack.shift();
-    }
-
-    canUndo() { return this.undoStack.length > 0; }
 
     /**
-     * 撤销上一次替换：把新句子换回原句（不会丢掉你之后写的其它内容）。
+     * 写回正文后自动检查：图片数量没有变少、文字没有大量丢失。
+     * 发现问题就把正文恢复成写回之前的样子，并返回失败。
      */
-    async undo() {
-      const u = this.undoStack[this.undoStack.length - 1];
-      if (!u) return { ok: false, reason: 'empty' };
-      const r = await this.replaceSentence(u.replacement, u.original, { allowFullBody: u.method === 'body' });
-      if (r.ok) {
-        this.undoStack.pop(); // 撤销本身产生的记录
-        this.undoStack.pop(); // 被撤销的那条
+    async verifyAfterWrite(beforeHtml, original, replacement) {
+      let after;
+      try { after = await this.getBodyHtml(); } catch (e) { return { ok: true }; } // 读不回来就不判断
+      const imgsBefore = countImages(beforeHtml);
+      const imgsAfter = countImages(after);
+      const lenBefore = TU.normalize(TU.htmlToText(beforeHtml)).length;
+      const lenAfter = TU.normalize(TU.htmlToText(after)).length;
+      const expected = lenBefore - TU.normalize(original).length + TU.normalize(replacement).length;
+      if (imgsAfter < imgsBefore || lenAfter < expected * 0.9 - 20) {
+        try { await this.setBodyHtml(beforeHtml); } catch (e) { /* 尽力恢复 */ }
+        return { ok: false, reason: imgsAfter < imgsBefore ? 'image_lost' : 'text_lost' };
       }
-      return r;
+      return { ok: true };
     }
-
-    reset() { this.undoStack = []; }
   }
+  Object.assign(OutlookHost.prototype, undoMethods);
 
   class StandaloneHost {
     constructor(editor, contextEl, subjectEl) {
@@ -158,42 +189,22 @@
       e.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
-    async replaceSentence(original, replacement) {
+    async replaceSentence(original, replacement, opts) {
+      const record = !opts || opts.record !== false;
       const e = this.editor;
       const sel = e.value.slice(e.selectionStart, e.selectionEnd);
       if (sel && TU.normalize(sel) === TU.normalize(original)) {
         await this.replaceSelection(replacement);
-        this.pushUndo({ original, replacement, method: 'selection' });
-        return { ok: true, method: 'selection' };
+        return { ok: true, method: 'selection', entry: record ? this.pushUndo({ original, replacement, method: 'selection' }) : null };
       }
       const r = TU.findInText(e.value, original);
       if (!r.ok) return r;
       e.setRangeText(replacement, r.start, r.end, 'preserve');
       e.dispatchEvent(new Event('input', { bubbles: true }));
-      this.pushUndo({ original, replacement, method: 'body' });
-      return { ok: true, method: 'body' };
+      return { ok: true, method: 'body', entry: record ? this.pushUndo({ original, replacement, method: 'body' }) : null };
     }
-
-    pushUndo(entry) {
-      this.undoStack.push(entry);
-      if (this.undoStack.length > 20) this.undoStack.shift();
-    }
-
-    canUndo() { return this.undoStack.length > 0; }
-
-    async undo() {
-      const u = this.undoStack[this.undoStack.length - 1];
-      if (!u) return { ok: false, reason: 'empty' };
-      const r = TU.findInText(this.editor.value, u.replacement);
-      if (!r.ok) return r;
-      this.editor.setRangeText(u.original, r.start, r.end, 'preserve');
-      this.editor.dispatchEvent(new Event('input', { bubbles: true }));
-      this.undoStack.pop();
-      return { ok: true, method: 'body' };
-    }
-
-    reset() { this.undoStack = []; }
   }
+  Object.assign(StandaloneHost.prototype, undoMethods);
 
-  root.MailPolishHost = { OutlookHost, StandaloneHost };
+  root.MailPolishHost = { OutlookHost, StandaloneHost, countImages };
 })(window);

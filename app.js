@@ -5,10 +5,14 @@
  *   每 1 秒读一次草稿 → 和上一次对比，变化的位置 ≈ 你正在打字的地方 → 找到那一句
  *   → 你停顿约 2 秒后，把这句（连同上下文）发给 AI → 结果显示在侧边栏，点「替换」写回邮件
  *   查过的句子会记住结果，不会重复花钱。
+ *
+ * 每条建议是一张「卡片」，卡片记住自己的状态：
+ *   待处理 → 点「替换」/「用这个」一键写回 → 已替换（可「撤销」，可「换个写法」再换）
  */
 (function () {
   'use strict';
 
+  const VERSION = '1.1.0';
   const TU = window.TextUtil;
   const AI = window.MailPolishAI;
   const HOSTS = window.MailPolishHost;
@@ -63,6 +67,15 @@
   }
   function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
 
+  /** 小按钮 */
+  function btn(label, kind, onclick, disabled) {
+    return el('button', { class: 'btn small' + (kind ? ' ' + kind : ''), onclick, disabled: disabled ? true : null }, label);
+  }
+
+  function diffNodes(a, b) {
+    return TU.wordDiff(a, b).map(op => (op.op === 'eq' ? op.text : el(op.op === 'del' ? 'del' : 'ins', {}, op.text)));
+  }
+
   let toastTimer = null;
   function toast(msg, ms) {
     const t = $('#toast');
@@ -86,14 +99,19 @@
       return ok;
     } catch (e) { return false; }
   }
-
-  function setBusy(btn, busyText) {
-    const label = btn.textContent;
-    btn.disabled = true;
-    clear(btn);
-    append(btn, [el('span', { class: 'spinner' }), ' ' + busyText]);
-    return () => { btn.disabled = false; btn.textContent = label; };
+  async function copyWithToast(text, okMsg) {
+    toast((await copyText(text)) ? (okMsg || '已复制') : '复制失败，请手动选择文字');
   }
+
+  function setBusy(button, busyText) {
+    const label = button.textContent;
+    button.disabled = true;
+    clear(button);
+    append(button, [el('span', { class: 'spinner' }), ' ' + busyText]);
+    return () => { button.disabled = false; button.textContent = label; };
+  }
+
+  function errText(e) { return e && e.message ? e.message : String(e); }
 
   // ---------------------------------------------------------------------------
   // 用量与费用（估算）
@@ -138,6 +156,7 @@
   function loadSettings() {
     const saved = store.get('settings', {});
     settings = Object.assign({}, AI.DEFAULT_SETTINGS, saved && typeof saved === 'object' ? saved : {});
+    if (settings.replaceMode !== 'confirm') settings.replaceMode = 'direct';
   }
   function saveSettings() { store.set('settings', settings); }
 
@@ -152,6 +171,7 @@
     $('#apiKey').type = 'password';
     $('#btnShowKey').textContent = '显示';
     $('#variant').value = settings.variant === 'UK' ? 'UK' : 'US';
+    $('#replaceMode').value = settings.replaceMode === 'confirm' ? 'confirm' : 'direct';
     $('#about').value = settings.about || '';
     $('#terms').value = settings.terms || '';
     $('#pauseMs').value = String(settings.pauseMs || 2000);
@@ -159,6 +179,7 @@
     $('#dailyCap').value = String(settings.dailyCap || AI.DEFAULT_SETTINGS.dailyCap);
     $('#baseUrl').value = settings.baseUrl || AI.DEFAULT_SETTINGS.baseUrl;
     $('#testResult').textContent = '';
+    $('#versionInfo').textContent = 'MailPolish 版本 ' + VERSION;
   }
 
   /** 读取表单；格式不对时返回 { error } */
@@ -173,6 +194,7 @@
         apiKey: $('#apiKey').value.trim(),
         model: $('#customModel').value.trim() || $('#model').value,
         variant: $('#variant').value === 'UK' ? 'UK' : 'US',
+        replaceMode: $('#replaceMode').value === 'confirm' ? 'confirm' : 'direct',
         about: $('#about').value.trim(),
         terms: $('#terms').value.trim(),
         pauseMs: parseInt($('#pauseMs').value, 10) || 2000,
@@ -227,20 +249,324 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 顶部提示条
+  // 顶部提示条（也用来做"没有卡片可挂靠"时的确认）
   // ---------------------------------------------------------------------------
   function showNotice(message, actions) {
     const n = $('#notice');
     clear(n);
     n.appendChild(el('div', {}, message));
     if (actions && actions.length) {
-      n.appendChild(el('div', { class: 'actions' }, actions.map(([label, fn]) => el('button', { class: 'btn small primary', onclick: fn }, label))));
+      n.appendChild(el('div', { class: 'actions' }, actions.map(([label, fn], i) => el('button', { class: 'btn small' + (i === 0 ? ' primary' : ''), onclick: fn }, label))));
     }
     n.hidden = false;
   }
   function hideNotice() { $('#notice').hidden = true; }
   function showSetupNotice() {
     showNotice('还没有填写 DeepSeek API Key。填好后就可以开始检查。', [['去设置', openSettings]]);
+  }
+  function askInNotice(message, labels) {
+    return new Promise(resolve => {
+      showNotice(message, labels.map((label, i) => [label, () => { hideNotice(); resolve(i); }]));
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // 替换 / 撤销（统一处理"有图片时先确认"的设置）
+  // ---------------------------------------------------------------------------
+  const IMAGE_CONFIRM_TEXT = '这封邮件里有图片（比如签名或来信里的 logo）。直接替换需要把整个正文写回 Outlook。' +
+    '替换后我会自动检查，图片变少就自动恢复原样。也可以先在邮件里选中这句话再替换，这样不会动到其它内容。';
+
+  function reasonText(reason, action) {
+    const verb = action === 'undo' ? '撤销' : '替换';
+    return ({
+      not_found: '在正文里没找到这句（可能刚刚又改过）。可以在邮件里选中它，再点「' + verb + '」。',
+      multiple: '这句话在正文里出现了不止一次。请先在邮件里选中要改的那一处，再点「' + verb + '」。',
+      crosses_paragraph: '这段文字跨了段落，没法自动定位。请先在邮件里选中它，再点「' + verb + '」。',
+      empty: '没有可' + verb + '的内容。',
+      has_images: '请先在邮件里选中这句话，再点「' + verb + '」。',
+      image_lost: '写回正文后检测到图片变少了，已经自动恢复原样。请先在邮件里选中这句话再' + verb + '，或者在设置里改成「有图片时先确认」。',
+      text_lost: '写回正文后检测到内容不完整，已经自动恢复原样。请先在邮件里选中这句话再' + verb + '。'
+    })[reason] || verb + '没有成功。';
+  }
+
+  /** ask(message, labels) → Promise<index> ：由调用方决定在卡片里问还是在顶部提示条里问 */
+  async function replaceWithPolicy(from, to, ask) {
+    const direct = settings.replaceMode !== 'confirm';
+    let r = await host.replaceSentence(from, to, { allowFullBody: direct });
+    if (!r.ok && r.reason === 'has_images') {
+      const choice = await ask(IMAGE_CONFIRM_TEXT, ['直接替换', '我先去选中']);
+      if (choice !== 0) return { ok: false, cancelled: true };
+      r = await host.replaceSentence(from, to, { allowFullBody: true });
+    }
+    return r;
+  }
+
+  async function revertWithPolicy(entry, ask) {
+    const direct = settings.replaceMode !== 'confirm';
+    let r = await host.revertEntry(entry, { allowFullBody: direct });
+    if (!r.ok && r.reason === 'has_images') {
+      const choice = await ask(IMAGE_CONFIRM_TEXT, ['直接撤销', '我先去选中']);
+      if (choice !== 0) return { ok: false, cancelled: true };
+      r = await host.revertEntry(entry, { allowFullBody: true });
+    }
+    return r;
+  }
+
+  /** 替换成功后：新文字算"已处理"，不再重复检查 */
+  function markApplied(text) {
+    TU.segmentSentences(text).forEach(s => {
+      const k = TU.sentenceKey(s.text);
+      live.cache.set(k, { status: 'applied', result: null, text: s.text, at: Date.now(), source: 'live' });
+      live.present.add(k);
+    });
+  }
+  function markPresent(text) {
+    TU.segmentSentences(text).forEach(s => live.present.add(TU.sentenceKey(s.text)));
+  }
+  function isPresent(text) {
+    const segs = TU.segmentSentences(text);
+    return segs.length > 0 && segs.every(s => live.present.has(TU.sentenceKey(s.text)));
+  }
+
+  // ---------------------------------------------------------------------------
+  // 建议卡片
+  // ---------------------------------------------------------------------------
+  const cards = new Map();          // id -> 卡片
+  const liveCardByKey = new Map();  // 原句 -> 卡片 id（边写边查）
+  let fullCardIds = [];             // 全文检查的卡片
+  let rewriteCardId = null;         // 改写结果卡片
+  let cardSeq = 0;
+
+  function newCard(source, original, extra) {
+    const card = Object.assign({
+      id: 'c' + (++cardSeq), source, key: TU.sentenceKey(original), original, result: null,
+      status: 'open', current: original, history: [], alts: null, altsSeen: [], altsRound: 0,
+      altsLoading: false, altsError: '', busy: false, confirm: null, paragraph: '', at: Date.now()
+    }, extra || {});
+    cards.set(card.id, card);
+    return card;
+  }
+
+  function upsertLiveCard(text, result, paragraph) {
+    const key = TU.sentenceKey(text);
+    const existing = cards.get(liveCardByKey.get(key));
+    if (existing) {
+      if (existing.status === 'open') { existing.result = result; existing.at = Date.now(); }
+      return existing;
+    }
+    const card = newCard('live', text, { result, paragraph: paragraph || '' });
+    liveCardByKey.set(key, card.id);
+    return card;
+  }
+
+  function rerender() {
+    renderLive();
+    renderFullCards();
+    renderRewriteCard();
+  }
+
+  /** 在卡片里问一个问题（状态保存在卡片上，界面刷新也不会丢） */
+  function askInCard(card) {
+    return (message, labels) => new Promise(resolve => {
+      card.confirm = { message, labels, resolve: i => { card.confirm = null; rerender(); resolve(i); } };
+      rerender();
+    });
+  }
+
+  async function applyCard(card, newText) {
+    if (card.busy) return;
+    const from = card.current;
+    if (TU.normalize(from) === TU.normalize(newText)) { toast('邮件里已经是这个写法了'); return; }
+    card.busy = true;
+    rerender();
+    try {
+      const r = await replaceWithPolicy(from, newText, askInCard(card));
+      if (r.cancelled) return;
+      if (!r.ok) { toast(reasonText(r.reason), 8000); return; }
+      if (r.entry) r.entry.cardId = card.id;
+      card.history.push({ from, to: newText, entry: r.entry });
+      card.current = newText;
+      card.status = 'applied';
+      card.at = Date.now();
+      markApplied(newText);
+      const orig = live.cache.get(card.key);
+      if (orig && orig.status !== 'applied') orig.status = 'replaced';
+      updateUndo();
+      toast(r.method === 'body' && inOutlook ? '已替换（光标可能会跳到正文开头）' : '已替换');
+    } catch (e) {
+      toast('替换失败：' + errText(e), 8000);
+    } finally {
+      card.busy = false;
+      rerender();
+    }
+  }
+
+  async function undoCard(card) {
+    const last = card.history[card.history.length - 1];
+    if (!last || card.busy) return;
+    card.busy = true;
+    rerender();
+    try {
+      const entry = last.entry || { original: last.from, replacement: last.to, method: 'body' };
+      const r = await revertWithPolicy(entry, askInCard(card));
+      if (r.cancelled) return;
+      if (!r.ok) { toast(reasonText(r.reason, 'undo'), 8000); return; }
+      card.history.pop();
+      card.current = last.from;
+      card.status = card.history.length ? 'applied' : 'open';
+      card.at = Date.now();
+      markPresent(last.from);
+      if (!card.history.length) {
+        const orig = live.cache.get(card.key);
+        if (orig) orig.status = card.result ? 'issues' : 'ok';
+      }
+      updateUndo();
+      toast('已撤销');
+    } catch (e) {
+      toast('撤销失败：' + errText(e), 8000);
+    } finally {
+      card.busy = false;
+      rerender();
+    }
+  }
+
+  function ignoreCard(card) {
+    card.status = 'ignored';
+    const orig = live.cache.get(card.key);
+    if (orig && orig.status === 'issues') orig.status = 'ignored';
+    rerender();
+  }
+
+  function dismissCard(card) {
+    card.status = 'dismissed';
+    rerender();
+  }
+
+  /** 「换个写法」：让 AI 给 3 种不同写法（避开之前给过的） */
+  async function loadAlternatives(card) {
+    if (card.altsLoading) return;
+    if (!settings.apiKey) { showSetupNotice(); return; }
+    card.altsLoading = true;
+    card.altsError = '';
+    rerender();
+    try {
+      const meta = await host.getMeta();
+      const avoid = [];
+      if (card.result) avoid.push(card.result.corrected, card.result.better);
+      (card.alts || []).forEach(a => avoid.push(a.text));
+      card.altsSeen.forEach(t => avoid.push(t));
+      avoid.push(card.current);
+      const uniq = Array.from(new Set(avoid.filter(Boolean).map(s => s.trim())))
+        .filter(s => TU.normalize(s) !== TU.normalize(card.original));
+      const ctx = { subject: meta.subject, composeType: meta.composeType, quoted: live.quoted || fullState.quoted || '', paragraph: card.paragraph };
+      const req = AI.buildAlternativesRequest(card.original, ctx, settings, uniq);
+      const r = await callAI(Object.assign({}, req, { timeoutMs: 45000 }));
+      const alts = AI.normalizeAlternatives(r.json, card.original, settings);
+      card.altsSeen = card.altsSeen.concat((card.alts || []).map(a => a.text));
+      card.alts = alts;
+      card.altsRound += 1;
+    } catch (e) {
+      card.altsError = AI.describeError(e);
+      if (e && e.kind === 'no_key') showSetupNotice();
+    } finally {
+      card.altsLoading = false;
+      rerender();
+    }
+  }
+
+  function cardSignature(card, focus) {
+    return [card.id, card.status, card.busy ? 1 : 0, card.current, card.history.length, card.altsLoading ? 1 : 0,
+      card.altsRound, card.altsError, card.confirm ? card.confirm.message : '', focus ? 1 : 0,
+      card.result ? card.result.corrected + card.result.better : '', card.versions ? card.versionsRound : '',
+      card.source === 'rewrite' && rwRunning ? 'running' : ''].join('\u0001');
+  }
+
+  /** 只有内容真的变了才重画，避免你点按钮时界面刚好刷新 */
+  function renderInto(container, items, renderFn) {
+    const sig = items.map(it => cardSignature(it.card, it.focus)).join('\u0002');
+    if (container.dataset.sig === sig) return;
+    container.dataset.sig = sig;
+    clear(container);
+    items.forEach(it => container.appendChild(renderFn(it.card, it.focus)));
+  }
+
+  function renderConfirm(card) {
+    if (!card.confirm) return null;
+    const c = card.confirm;
+    return el('div', { class: 'confirm' },
+      el('div', {}, c.message),
+      el('div', { class: 'actions' }, c.labels.map((label, i) => btn(label, i === 0 ? 'primary' : '', () => c.resolve(i)))));
+  }
+
+  function renderAlternatives(card) {
+    if (!card.altsLoading && !card.alts && !card.altsError) return null;
+    const box = el('div', { class: 'alts' }, el('div', { class: 'cap' }, '其他写法'));
+    const busy = card.busy || card.altsLoading;
+    if (card.altsError) box.appendChild(el('div', { class: 'warn' }, card.altsError));
+    (card.alts || []).forEach(a => {
+      const inUse = TU.normalize(a.text) === TU.normalize(card.current);
+      box.appendChild(el('div', { class: 'alt' + (inUse ? ' in-use' : '') },
+        el('div', { class: 'alt-head' }, el('span', { class: 'chip t-clarity' }, a.label), inUse ? el('span', { class: 'chip ok' }, '正在使用') : null),
+        el('div', { class: 'text' }, a.text),
+        a.warnings.map(w => el('div', { class: 'warn' }, '⚠ ' + w)),
+        el('div', { class: 'actions' },
+          btn(inUse ? '已使用' : '用这个', inUse ? '' : 'primary', () => applyCard(card, a.text), busy || inUse),
+          btn('复制', 'ghost', () => copyWithToast(a.text)))));
+    });
+    if (card.altsLoading) box.appendChild(el('div', { class: 'muted small loading' }, el('span', { class: 'spinner' }), ' 正在生成新的写法…'));
+    else box.appendChild(el('div', { class: 'actions' }, btn('再换一批', 'ghost', () => loadAlternatives(card), busy)));
+    return box;
+  }
+
+  /** 一张建议卡片（边写边查和全文检查共用） */
+  function renderCard(card, focus) {
+    const res = card.result || { issues: [], warnings: [], changed: false, corrected: card.original, better: '', betterWarnings: [], betterExplain: '' };
+    const applied = card.status === 'applied';
+    const busy = card.busy;
+    const box = el('div', { class: 'card' + (focus ? ' focus' : '') + (applied ? ' is-applied' : '') });
+    const types = Array.from(new Set(res.issues.map(i => i.type)));
+
+    box.appendChild(el('div', { class: 'card-head' },
+      focus ? el('span', { class: 'chip badge' }, '正在写的句子') : null,
+      applied ? el('span', { class: 'chip ok' }, '✓ 已替换') : types.map(t => el('span', { class: 'chip t-' + t }, AI.ISSUE_TYPES[t] || t)),
+      !applied && !types.length ? el('span', { class: 'chip t-tone' }, '表达') : null,
+      busy ? el('span', { class: 'muted small' }, el('span', { class: 'spinner' }), ' 处理中') : null));
+
+    if (applied) {
+      box.appendChild(el('div', { class: 'diff' }, diffNodes(card.original, card.current)));
+      const terms = TU.parseTerms(settings.terms);
+      TU.invariantWarnings(card.original, card.current, terms).forEach(w => box.appendChild(el('div', { class: 'warn' }, '⚠ ' + w)));
+      box.appendChild(el('div', { class: 'actions' },
+        btn('撤销', 'primary', () => undoCard(card), busy),
+        btn('换个写法', '', () => loadAlternatives(card), busy || card.altsLoading),
+        btn('收起', 'ghost', () => dismissCard(card), busy)));
+    } else {
+      box.appendChild(el('div', { class: 'diff' }, res.changed ? diffNodes(card.original, res.corrected) : card.original));
+      if (res.issues.length) {
+        box.appendChild(el('ul', { class: 'issue-list' }, res.issues.map(i => el('li', {},
+          el('span', { class: 'fix' }, (i.original || '∅') + ' → ' + (i.suggestion || '（删除）')),
+          i.explain ? el('span', { class: 'why' }, '　' + i.explain) : null))));
+      }
+      res.warnings.forEach(w => box.appendChild(el('div', { class: 'warn' }, '⚠ ' + w)));
+      box.appendChild(el('div', { class: 'actions' },
+        res.changed ? btn('替换', 'primary', () => applyCard(card, res.corrected), busy) : null,
+        btn('换个写法', '', () => loadAlternatives(card), busy || card.altsLoading),
+        btn('忽略', '', () => ignoreCard(card), busy),
+        res.changed ? btn('复制', 'ghost', () => copyWithToast(res.corrected)) : null));
+      if (res.better) {
+        box.appendChild(el('div', { class: 'better' },
+          el('div', { class: 'cap' }, '更专业的写法'),
+          el('div', { class: 'text' }, res.better),
+          res.betterExplain ? el('div', { class: 'note' }, res.betterExplain) : null,
+          res.betterWarnings.map(w => el('div', { class: 'warn' }, '⚠ ' + w)),
+          el('div', { class: 'actions' },
+            btn('用这个', '', () => applyCard(card, res.better), busy),
+            btn('复制', 'ghost', () => copyWithToast(res.better)))));
+      }
+    }
+    append(box, renderConfirm(card));
+    append(box, renderAlternatives(card));
+    return box;
   }
 
   // ---------------------------------------------------------------------------
@@ -280,6 +606,10 @@
     live.focusPara = '';
     live.history = [];
     live.bulkHint = false;
+    for (const [id, card] of Array.from(cards)) {
+      if (card.source === 'live') cards.delete(id);
+    }
+    liveCardByKey.clear();
     renderLive();
   }
 
@@ -332,6 +662,7 @@
       if (live.prevMine === null) { // 第一次读取：记下现有内容，不主动检查
         live.prevMine = mine;
         live.present = presentKeys(mine);
+        renderLive();
         return;
       }
 
@@ -345,13 +676,16 @@
           // 一次出现很多新句子（例如粘贴了一大段）：不逐句自动检查，提示用「全文检查」
           live.bulkHint = true;
         } else {
-          for (const s of ch.sentences) live.dirty.set(TU.sentenceKey(s.text), s.text);
+          for (const s of ch.sentences) {
+            const k = TU.sentenceKey(s.text);
+            if (!live.cache.has(k)) live.dirty.set(k, s.text); // 已检查过/刚替换的句子不再排队
+          }
         }
         live.focus = focus ? { key: TU.sentenceKey(focus.text), text: focus.text } : null;
         live.focusPara = focus ? TU.paragraphAt(mine, focus.start) : '';
         live.present = presentKeys(mine);
         for (const k of Array.from(live.dirty.keys())) if (!live.present.has(k)) live.dirty.delete(k);
-        setLiveStatus('typing');
+        setLiveStatus(live.dirty.size || live.inFlight.size ? 'typing' : 'done');
         renderLive();
         return;
       }
@@ -365,7 +699,7 @@
     } catch (e) {
       if (!live.hostError) {
         live.hostError = true;
-        setLiveStatus('error', '读取邮件内容失败：' + (e && e.message ? e.message : e));
+        setLiveStatus('error', '读取邮件内容失败：' + errText(e));
       }
     } finally {
       live.busy = false;
@@ -397,10 +731,11 @@
     setLiveStatus('checking', items.length);
     renderLive();
     const sentences = items.map((it, i) => ({ id: i + 1, text: it.text }));
+    const paragraph = live.focusPara;
     try {
       const meta = await host.getMeta();
       const req = AI.buildCheckRequest(sentences, {
-        subject: meta.subject, composeType: meta.composeType, quoted: live.quoted, paragraph: live.focusPara
+        subject: meta.subject, composeType: meta.composeType, quoted: live.quoted, paragraph
       }, settings, 'live');
       const r = await callAI(Object.assign({}, req, { timeoutMs: 30000 }));
       const out = AI.normalizeCheckResult(r.json, sentences, settings);
@@ -408,6 +743,7 @@
       sentences.forEach((s, i) => {
         const res = byId.get(s.id) || null;
         live.cache.set(items[i].key, { status: res ? 'issues' : 'ok', result: res, text: s.text, at: Date.now(), source: 'live' });
+        if (res) upsertLiveCard(s.text, res, paragraph);
         pushHistory(items[i].key);
       });
       pruneCache();
@@ -471,6 +807,19 @@
     live.history = [key].concat(live.history.filter(k => k !== key)).slice(0, 15);
   }
 
+  function visibleLiveCards() {
+    const f = live.focus;
+    const isFocus = c => !!f && TU.segmentSentences(c.current).some(s => TU.sentenceKey(s.text) === f.key);
+    const list = [];
+    for (const card of cards.values()) {
+      if (card.source !== 'live' || card.status === 'ignored' || card.status === 'dismissed') continue;
+      if (!isPresent(card.current) && !card.busy && !card.confirm) continue;
+      list.push(card);
+    }
+    list.sort((a, b) => (Number(isFocus(b)) - Number(isFocus(a))) || (b.at - a.at));
+    return list.slice(0, 6).map(card => ({ card, focus: isFocus(card) }));
+  }
+
   function renderLive() {
     // 0) 粘贴了一大段时的提示
     const bulk = $('#liveBulk');
@@ -505,19 +854,10 @@
     }
     cur.hidden = !showCurrent;
 
-    // 2) 建议卡片：正文里还在、有问题、没被忽略或替换的句子；正在写的那句排最前
-    const wrap = $('#liveCards');
-    clear(wrap);
-    const list = [];
-    for (const [key, entry] of live.cache) {
-      if (entry.status !== 'issues' || entry.source !== 'live' || !live.present.has(key) || !entry.result) continue;
-      list.push({ key, entry, isFocus: !!f && f.key === key });
-    }
-    list.sort((a, b) => (Number(b.isFocus) - Number(a.isFocus)) || (b.entry.at - a.entry.at));
-    list.slice(0, 6).forEach(({ key, entry, isFocus }) => {
-      wrap.appendChild(renderResultCard(key, entry.result, { focus: isFocus, onDone: () => renderLive() }));
-    });
-    $('#liveHint').hidden = list.length > 0 || showCurrent;
+    // 2) 建议卡片
+    const items = visibleLiveCards();
+    renderInto($('#liveCards'), items, renderCard);
+    $('#liveHint').hidden = items.length > 0 || showCurrent;
 
     // 3) 最近检查
     renderHistory();
@@ -529,162 +869,56 @@
     const items = live.history.map(k => live.cache.get(k)).filter(Boolean);
     $('#liveHistoryWrap').hidden = items.length === 0;
     $('#histCount').textContent = String(items.length);
-    const marks = { ok: '✓', applied: '✓', issues: '!', ignored: '–', error: '×' };
+    const marks = { ok: '✓', applied: '✓', replaced: '✓', issues: '!', ignored: '–', error: '×' };
     for (const e of items) {
       box.appendChild(el('div', { class: 'hist-item ' + e.status }, el('span', { class: 'mark' }, marks[e.status] || '·'), el('span', {}, e.text)));
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // 建议卡片（边写边查和全文检查共用）
-  // ---------------------------------------------------------------------------
-  function renderResultCard(key, res, opts) {
-    const card = el('div', { class: 'card' + (opts.focus ? ' focus' : '') });
-    const types = Array.from(new Set(res.issues.map(i => i.type)));
-    card.appendChild(el('div', { class: 'card-head' },
-      opts.focus ? el('span', { class: 'chip badge' }, '正在写的句子') : null,
-      types.map(t => el('span', { class: 'chip t-' + t }, AI.ISSUE_TYPES[t] || t)),
-      !types.length ? el('span', { class: 'chip t-tone' }, '表达') : null));
-
-    if (res.changed) {
-      card.appendChild(el('div', { class: 'diff' },
-        TU.wordDiff(res.original, res.corrected).map(op => (op.op === 'eq' ? op.text : el(op.op === 'del' ? 'del' : 'ins', {}, op.text)))));
-    } else {
-      card.appendChild(el('div', { class: 'diff' }, res.original));
-    }
-
-    if (res.issues.length) {
-      card.appendChild(el('ul', { class: 'issue-list' }, res.issues.map(i => el('li', {},
-        el('span', { class: 'fix' }, (i.original || '∅') + ' → ' + (i.suggestion || '（删除）')),
-        i.explain ? el('span', { class: 'why' }, '　' + i.explain) : null))));
-    }
-    res.warnings.forEach(w => card.appendChild(el('div', { class: 'warn' }, '⚠ ' + w)));
-
-    const actions = el('div', { class: 'actions' });
-    if (res.changed) actions.appendChild(el('button', { class: 'btn small primary', onclick: () => applyFix(card, key, res.original, res.corrected, opts) }, '替换'));
-    actions.appendChild(el('button', { class: 'btn small', onclick: () => { markIgnored(key); card.remove(); if (opts.onDone) opts.onDone('ignored'); } }, '忽略'));
-    if (res.changed) {
-      actions.appendChild(el('button', {
-        class: 'btn small ghost',
-        onclick: async () => toast((await copyText(res.corrected)) ? '已复制' : '复制失败，请手动选择文字')
-      }, '复制'));
-    }
-    card.appendChild(actions);
-
-    if (res.better) {
-      card.appendChild(el('div', { class: 'better' },
-        el('div', { class: 'cap' }, '更专业的写法'),
-        el('div', { class: 'text' }, res.better),
-        res.betterExplain ? el('div', { class: 'note' }, res.betterExplain) : null,
-        res.betterWarnings.map(w => el('div', { class: 'warn' }, '⚠ ' + w)),
-        el('div', { class: 'actions' },
-          el('button', { class: 'btn small', onclick: () => applyFix(card, key, res.original, res.better, opts) }, '用这个'),
-          el('button', { class: 'btn small ghost', onclick: async () => toast((await copyText(res.better)) ? '已复制' : '复制失败，请手动选择文字') }, '复制'))));
-    }
-    return card;
-  }
-
-  function markIgnored(key) {
-    const e = live.cache.get(key);
-    if (e) e.status = 'ignored';
-  }
-
-  function confirmInCard(card, message, labels) {
-    return new Promise(resolve => {
-      const box = el('div', { class: 'confirm' }, el('div', {}, message));
-      const acts = el('div', { class: 'actions' });
-      labels.forEach((label, i) => acts.appendChild(el('button', {
-        class: 'btn small' + (i === 0 ? ' primary' : ''),
-        onclick: () => { box.remove(); resolve(i); }
-      }, label)));
-      box.appendChild(acts);
-      card.appendChild(box);
-    });
-  }
-
-  function reasonText(reason) {
-    return ({
-      not_found: '在正文里没找到这句（可能刚刚又改过）。可以在邮件里选中它，再点「替换」。',
-      multiple: '这句话在正文里出现了不止一次。请先在邮件里选中要改的那一处，再点「替换」。',
-      crosses_paragraph: '这句话跨了段落，没法自动定位。请先在邮件里选中它，再点「替换」。',
-      empty: '没有可替换的内容。',
-      has_images: '请先在邮件里选中这句话，再点按钮。'
-    })[reason] || '替换没有成功。';
-  }
-
-  async function applyFix(card, key, original, replacement, opts) {
-    const buttons = Array.from(card.querySelectorAll('.actions button'));
-    buttons.forEach(b => { b.disabled = true; });
-    try {
-      let r = await host.replaceSentence(original, replacement, { allowFullBody: false });
-      if (!r.ok && r.reason === 'has_images') {
-        const choice = await confirmInCard(card,
-          '这封邮件里有图片（比如签名里的 logo）。直接替换需要把整个正文写回 Outlook，我没法保证图片一定不受影响。更稳妥的做法：先在邮件里选中这句话，再点「替换」。',
-          ['仍然直接替换', '我先去选中']);
-        if (choice !== 0) return;
-        r = await host.replaceSentence(original, replacement, { allowFullBody: true });
-      }
-      if (!r.ok) { toast(reasonText(r.reason), 6500); return; }
-
-      // 记住：替换后的句子不需要再检查
-      TU.segmentSentences(replacement).forEach(s => {
-        live.cache.set(TU.sentenceKey(s.text), { status: 'applied', result: null, text: s.text, at: Date.now(), source: 'live' });
-      });
-      const e = live.cache.get(key);
-      if (e) e.status = 'applied';
-      card.classList.add('applied');
-      updateUndo();
-      toast(r.method === 'body' && inOutlook ? '已替换。注意：光标可能跳到正文开头或结尾。' : '已替换');
-      if (opts && opts.onDone) opts.onDone('applied');
-    } catch (err) {
-      toast('替换失败：' + (err && err.message ? err.message : err), 6500);
-    } finally {
-      buttons.forEach(b => { b.disabled = false; });
-    }
-  }
-
   function updateUndo() { $('#btnUndo').hidden = !(host && host.canUndo()); }
 
+  /** 底部「撤销上次替换」：撤销最近一次替换（属于哪张卡片就交给那张卡片处理） */
   async function onUndo() {
-    const top = host.undoStack[host.undoStack.length - 1];
-    try {
-      const r = await host.undo();
-      if (r.ok) {
-        if (top) {
-          const e = live.cache.get(TU.sentenceKey(top.original));
-          if (e && e.status === 'applied' && e.result) e.status = 'issues';
-        }
-        toast('已撤销');
-        renderLive();
-      } else if (r.reason === 'has_images') {
-        toast('请先在邮件里选中刚才替换的那句话，再点「撤销上次替换」。', 6500);
-      } else {
-        toast(reasonText(r.reason).replace('「替换」', '「撤销上次替换」'), 6500);
-      }
-    } catch (e) {
-      toast('撤销失败：' + (e && e.message ? e.message : e), 6500);
+    const top = host.lastUndo();
+    if (!top) { updateUndo(); return; }
+    const card = top.cardId ? cards.get(top.cardId) : null;
+    if (card && card.history.length && card.history[card.history.length - 1].entry === top) {
+      if (card.status === 'dismissed') card.status = 'applied';
+      await undoCard(card);
+      return;
     }
-    updateUndo();
+    try {
+      const r = await revertWithPolicy(top, askInNotice);
+      if (r.cancelled) return;
+      toast(r.ok ? '已撤销' : reasonText(r.reason, 'undo'), r.ok ? 3000 : 8000);
+    } catch (e) {
+      toast('撤销失败：' + errText(e), 8000);
+    } finally {
+      updateUndo();
+      rerender();
+    }
   }
 
   // ---------------------------------------------------------------------------
   // 全文检查
   // ---------------------------------------------------------------------------
-  let fullRunning = false;
+  const fullState = { running: false, quoted: '' };
 
   async function runFullCheck() {
-    if (fullRunning) return;
+    if (fullState.running) return;
     if (!host.isCompose()) { toast('请在写邮件或回复时使用'); return; }
     if (!settings.apiKey) { showSetupNotice(); return; }
-    fullRunning = true;
+    fullState.running = true;
     const done = setBusy($('#btnFull'), '正在检查…');
     const ov = $('#fullOverall');
-    const cards = $('#fullCards');
     clear(ov);
-    clear(cards);
+    fullCardIds.forEach(id => cards.delete(id));
+    fullCardIds = [];
+    renderFullCards();
     try {
       const draft = await host.getDraft();
       const meta = await host.getMeta();
+      fullState.quoted = draft.quoted || '';
       const seen = new Set();
       let sentences = TU.segmentSentences(draft.mine).filter(s => {
         if (!TU.isCheckableEnglish(s.text)) return false;
@@ -707,32 +941,30 @@
         const prev = live.cache.get(key);
         if (!prev || prev.source !== 'live') live.cache.set(key, { status: res ? 'issues' : 'ok', result: res, text: s.text, at: Date.now(), source: 'full' });
       });
-      renderFull(out, note, list.length);
+      out.results.forEach(res => fullCardIds.push(newCard('full', res.original, { result: res }).id));
+      ov.appendChild(el('div', { class: 'overall' },
+        el('div', { class: 'cap' }, '整体评价'),
+        el('div', {}, out.overall || '（AI 没有给出整体评价）'),
+        el('div', { class: 'muted small mt' },
+          '检查了 ' + list.length + ' 句，' + (out.results.length ? '有 ' + out.results.length + ' 句可以改进。' : '没有发现需要修改的地方。') + (note ? ' ' + note : ''))));
+      if (!out.results.length) ov.appendChild(el('div', { class: 'allgood' }, '✓ 没有发现问题'));
+      renderFullCards();
       live.bulkHint = false;
       renderLive();
     } catch (e) {
       ov.appendChild(el('div', { class: 'warn' }, AI.describeError(e)));
       if (e && e.kind === 'no_key') showSetupNotice();
     } finally {
-      fullRunning = false;
+      fullState.running = false;
       done();
     }
   }
 
-  function renderFull(out, note, count) {
-    const ov = $('#fullOverall');
-    clear(ov);
-    ov.appendChild(el('div', { class: 'overall' },
-      el('div', { class: 'cap' }, '整体评价'),
-      el('div', {}, out.overall || '（AI 没有给出整体评价）'),
-      el('div', { class: 'muted small mt' },
-        '检查了 ' + count + ' 句，' + (out.results.length ? '有 ' + out.results.length + ' 句可以改进。' : '没有发现需要修改的地方。') + (note ? ' ' + note : ''))));
-    const wrap = $('#fullCards');
-    clear(wrap);
-    if (!out.results.length) { wrap.appendChild(el('div', { class: 'allgood' }, '✓ 没有发现问题')); return; }
-    out.results.forEach(res => {
-      wrap.appendChild(renderResultCard(TU.sentenceKey(res.original), res, { focus: false }));
-    });
+  function renderFullCards() {
+    const items = fullCardIds.map(id => cards.get(id))
+      .filter(c => c && c.status !== 'ignored' && c.status !== 'dismissed')
+      .map(card => ({ card, focus: false }));
+    renderInto($('#fullCards'), items, renderCard);
   }
 
   // ---------------------------------------------------------------------------
@@ -752,85 +984,140 @@
     AI.SCENARIOS.forEach(s => sel.appendChild(el('option', { value: s.id }, s.label)));
   }
 
-  async function runRewrite() {
-    if (rwRunning) return;
-    const out = $('#rewriteResults');
+  function rewriteNotice(msg) {
+    const out = $('#rewriteMsg');
     clear(out);
-    if (!host.isCompose()) { out.appendChild(el('div', { class: 'warn' }, '请在写邮件或回复时使用。')); return; }
+    if (msg) out.appendChild(el('div', { class: 'warn' }, msg));
+  }
+
+  /** 生成改写。regenerate=true 时沿用上一次的原文，并要求 AI 写得和之前的版本不一样 */
+  async function runRewrite(regenerate) {
+    if (rwRunning) return;
+    rewriteNotice('');
+    if (!host.isCompose()) { rewriteNotice('请在写邮件或回复时使用。'); return; }
     if (!settings.apiKey) { showSetupNotice(); return; }
-    const sourceInput = document.querySelector('input[name="rwSource"]:checked');
-    const source = sourceInput ? sourceInput.value : 'selection';
+    const prevCard = rewriteCardId ? cards.get(rewriteCardId) : null;
     let text = '';
-    try {
-      if (source === 'selection') {
-        try { text = await host.getSelectedText(); } catch (e) { text = ''; } // 光标在收件人/主题栏时会读不到
-        if (!text.trim()) {
-          out.appendChild(el('div', { class: 'warn' }, '请先在邮件正文里选中要改写的文字（可以是中文），再点「生成改写」。'));
-          return;
+    let source = 'selection';
+    if (regenerate && prevCard) {
+      text = prevCard.original;
+      source = prevCard.rwSource;
+    } else {
+      const sourceInput = document.querySelector('input[name="rwSource"]:checked');
+      source = sourceInput ? sourceInput.value : 'selection';
+      try {
+        if (source === 'selection') {
+          try { text = await host.getSelectedText(); } catch (e) { text = ''; } // 光标在收件人/主题栏时会读不到
+          if (!text.trim()) { rewriteNotice('请先在邮件正文里选中要改写的文字（可以是中文），再点「生成改写」。'); return; }
+        } else {
+          text = ((await host.getDraft()).mine || '').trim();
+          if (!text) { rewriteNotice('邮件里还没有你写的内容。'); return; }
         }
-      } else {
-        text = ((await host.getDraft()).mine || '').trim();
-        if (!text) { out.appendChild(el('div', { class: 'warn' }, '邮件里还没有你写的内容。')); return; }
+      } catch (e) {
+        rewriteNotice('读取邮件内容失败：' + errText(e));
+        return;
       }
-    } catch (e) {
-      out.appendChild(el('div', { class: 'warn' }, '读取邮件内容失败：' + (e && e.message ? e.message : e)));
-      return;
     }
 
     rwRunning = true;
     const done = setBusy($('#btnRewrite'), '正在改写…');
+    if (prevCard && regenerate) { prevCard.busy = true; renderRewriteCard(); }
     try {
       const draft = await host.getDraft();
       const meta = await host.getMeta();
-      const req = AI.buildRewriteRequest(text, { subject: meta.subject, quoted: draft.quoted }, settings, rwTone, $('#scenario').value, $('#rwExtra').value);
+      const avoid = regenerate && prevCard ? prevCard.versionsSeen.concat(prevCard.versions.map(v => v.text)) : [];
+      const req = AI.buildRewriteRequest(text, { subject: meta.subject, quoted: draft.quoted }, settings, rwTone, $('#scenario').value, $('#rwExtra').value, avoid);
       const r = await callAI(Object.assign({}, req, { timeoutMs: 120000 }));
-      renderRewrite(AI.normalizeRewriteResult(r.json, text, settings), text, source);
+      const res = AI.normalizeRewriteResult(r.json, text, settings);
+      if (regenerate && prevCard) {
+        prevCard.versionsSeen = avoid;
+        prevCard.versions = res.versions;
+        prevCard.notes = res.notes;
+        prevCard.versionsRound += 1;
+      } else {
+        if (prevCard) cards.delete(prevCard.id);
+        const card = newCard('rewrite', text, { versions: res.versions, notes: res.notes, versionsSeen: [], versionsRound: 1, rwSource: source });
+        rewriteCardId = card.id;
+      }
     } catch (e) {
-      out.appendChild(el('div', { class: 'warn' }, AI.describeError(e)));
+      rewriteNotice(AI.describeError(e));
       if (e && e.kind === 'no_key') showSetupNotice();
     } finally {
+      if (prevCard) prevCard.busy = false;
       rwRunning = false;
       done();
+      renderRewriteCard();
     }
   }
 
-  function renderRewrite(res, sourceText, source) {
+  function renderRewriteCard() {
     const out = $('#rewriteResults');
-    clear(out);
-    if (res.notes) out.appendChild(el('div', { class: 'overall' }, el('div', { class: 'cap' }, '改动说明'), el('div', {}, res.notes)));
-    res.versions.forEach(v => {
-      const card = el('div', { class: 'card' },
-        el('div', { class: 'card-head' }, el('span', { class: 'chip t-clarity' }, v.label)),
-        el('div', { class: 'rw-text' }, v.text),
-        v.warnings.map(w => el('div', { class: 'warn' }, '⚠ ' + w)));
-      card.appendChild(el('div', { class: 'actions' },
-        el('button', { class: 'btn small primary', onclick: () => applyRewrite(card, v.text, sourceText) }, '替换选中内容'),
-        el('button', { class: 'btn small', onclick: async () => toast((await copyText(v.text)) ? '已复制，可以粘贴到邮件里' : '复制失败，请手动选择文字') }, '复制')));
-      out.appendChild(card);
-    });
-    out.appendChild(el('details', { class: 'history' },
-      el('summary', {}, '原文（想恢复时可以复制回去）'),
-      el('div', { class: 'rw-text' }, sourceText),
-      el('div', { class: 'actions' }, el('button', { class: 'btn small ghost', onclick: async () => toast((await copyText(sourceText)) ? '已复制原文' : '复制失败') }, '复制原文'))));
-    if (source === 'all') out.appendChild(el('p', { class: 'hint' }, '要整段替换：先在邮件里选中你写的部分，再点「替换选中内容」；也可以点「复制」后自己粘贴。'));
+    const card = rewriteCardId ? cards.get(rewriteCardId) : null;
+    renderInto(out, card ? [{ card, focus: false }] : [], renderRewriteBody);
   }
 
-  async function applyRewrite(card, text, sourceText) {
-    let sel = '';
-    try { sel = await host.getSelectedText(); } catch (e) { sel = ''; }
-    if (!sel.trim()) { toast('请先在邮件里选中要替换的文字，再点「替换选中内容」。', 6500); return; }
-    if (TU.normalize(sel) !== TU.normalize(sourceText)) {
-      const choice = await confirmInCard(card, '你现在选中的文字和改写前的原文不一样。仍然用改写结果替换当前选中的内容吗？', ['替换', '取消']);
-      if (choice !== 0) return;
+  function renderRewriteBody(card) {
+    const wrap = el('div', { class: 'rw-wrap' });
+    const busy = card.busy || rwRunning;
+    if (card.notes) wrap.appendChild(el('div', { class: 'overall' }, el('div', { class: 'cap' }, '改动说明'), el('div', {}, card.notes)));
+    card.versions.forEach(v => {
+      const inUse = card.status === 'applied' && TU.normalize(v.text) === TU.normalize(card.current);
+      wrap.appendChild(el('div', { class: 'card' + (inUse ? ' is-applied' : '') },
+        el('div', { class: 'card-head' }, el('span', { class: 'chip t-clarity' }, v.label), inUse ? el('span', { class: 'chip ok' }, '✓ 已替换') : null),
+        el('div', { class: 'rw-text' }, v.text),
+        v.warnings.map(w => el('div', { class: 'warn' }, '⚠ ' + w)),
+        el('div', { class: 'actions' },
+          inUse ? btn('撤销', 'primary', () => undoCard(card), busy) : btn(card.status === 'applied' ? '换成这个' : '替换选中内容', 'primary', () => applyRewrite(card, v.text), busy),
+          btn('复制', 'ghost', () => copyWithToast(v.text, '已复制，可以粘贴到邮件里')))));
+    });
+    append(wrap, renderConfirm(card));
+    wrap.appendChild(el('div', { class: 'actions' },
+      btn('都不满意，重新生成', '', () => runRewrite(true), busy),
+      card.status === 'applied' ? btn('撤销上一步', 'ghost', () => undoCard(card), busy) : null,
+      card.busy ? el('span', { class: 'muted small' }, el('span', { class: 'spinner' }), ' 处理中…') : null));
+    wrap.appendChild(el('details', { class: 'history' },
+      el('summary', {}, '原文（想恢复时也可以复制回去）'),
+      el('div', { class: 'rw-text' }, card.original),
+      el('div', { class: 'actions' }, btn('复制原文', 'ghost', () => copyWithToast(card.original, '已复制原文')))));
+    if (card.rwSource === 'all' && card.status !== 'applied') {
+      wrap.appendChild(el('p', { class: 'hint' }, '整封改写：如果一键替换提示定位不到，请先在邮件里选中你写的部分，再点「替换选中内容」。'));
     }
+    return wrap;
+  }
+
+  async function applyRewrite(card, text) {
+    if (card.busy) return;
+    card.busy = true;
+    renderRewriteCard();
     try {
-      await host.replaceSelection(text);
-      TU.segmentSentences(text).forEach(s => {
-        live.cache.set(TU.sentenceKey(s.text), { status: 'applied', result: null, text: s.text, at: Date.now(), source: 'live' });
-      });
-      toast('已替换。如果想恢复，下方「原文」里可以复制回去。', 5000);
+      const from = card.current;
+      let r;
+      if (card.status !== 'applied' && card.rwSource === 'selection') {
+        // 第一次替换：优先替换当前选中的文字
+        let sel = '';
+        try { sel = await host.getSelectedText(); } catch (e) { sel = ''; }
+        if (sel.trim() && TU.normalize(sel) !== TU.normalize(from)) {
+          const choice = await askInCard(card)('你现在选中的文字和改写前的原文不一样。仍然用改写结果替换当前选中的内容吗？', ['替换', '取消']);
+          if (choice !== 0) return;
+          await host.replaceSelection(text);
+          r = { ok: true, method: 'selection', entry: host.pushUndo({ original: sel, replacement: text, method: 'selection' }) };
+        }
+      }
+      if (!r) r = await replaceWithPolicy(from, text, askInCard(card));
+      if (r.cancelled) return;
+      if (!r.ok) { toast(reasonText(r.reason), 8000); return; }
+      if (r.entry) r.entry.cardId = card.id;
+      card.history.push({ from: r.entry ? r.entry.original : from, to: text, entry: r.entry });
+      card.current = text;
+      card.status = 'applied';
+      markApplied(text);
+      updateUndo();
+      toast('已替换。不满意可以点「撤销」，或者换另一个版本。', 5000);
     } catch (e) {
-      toast('替换失败：' + (e && e.message ? e.message : e), 6500);
+      toast('替换失败：' + errText(e), 8000);
+    } finally {
+      card.busy = false;
+      renderRewriteCard();
     }
   }
 
@@ -866,8 +1153,12 @@
     host.reset();
     resetLive();
     clear($('#fullOverall'));
-    clear($('#fullCards'));
-    clear($('#rewriteResults'));
+    fullCardIds.forEach(id => cards.delete(id));
+    fullCardIds = [];
+    if (rewriteCardId) cards.delete(rewriteCardId);
+    rewriteCardId = null;
+    rewriteNotice('');
+    rerender();
     updateUndo();
     applyLiveToggle();
   }
@@ -890,7 +1181,7 @@
       applyLiveToggle();
     });
     $('#btnFull').addEventListener('click', runFullCheck);
-    $('#btnRewrite').addEventListener('click', runRewrite);
+    $('#btnRewrite').addEventListener('click', () => runRewrite(false));
     $('#btnUndo').addEventListener('click', onUndo);
     $('#btnManifest').addEventListener('click', downloadManifest);
   }
@@ -929,7 +1220,7 @@
     switchTab(store.get('tab', 'live'));
     if (!settings.apiKey) showSetupNotice();
     applyLiveToggle();
-    renderLive();
+    rerender();
   }
 
   if (window.Office && typeof Office.onReady === 'function') {
