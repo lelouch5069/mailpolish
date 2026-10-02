@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge">
+  <title>MailPolish 邮件润色</title>
+  <!-- 微软 Office.js（Outlook 插件必须从微软官方地址加载） -->
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <link rel="stylesheet" href="app.css">
+  <link rel="icon" href="icon-32.png">
+</head>
+<body>
+  <div id="app" class="app">
+
+    <!-- 浏览器模式：没有装进 Outlook 时，用这里的文本框模拟邮件 -->
+    <section id="standalone" class="standalone" hidden>
+      <div class="sa-banner">
+        <div>
+          <div class="sa-title">浏览器模式</div>
+          <div class="muted">在这里试用，效果和装进 Outlook 后一样。确认好用后，点右边按钮下载 Outlook 安装文件。</div>
+        </div>
+        <button id="btnManifest" class="btn">下载 Outlook 安装文件</button>
+      </div>
+      <label class="lbl" for="saSubject">主题</label>
+      <input id="saSubject" class="input" placeholder="例如：Re: PO 4500123 shipment schedule">
+      <label class="lbl" for="saEditor">你的邮件草稿（像在 Outlook 里一样写英文，停顿 2 秒会自动检查）</label>
+      <textarea id="saEditor" class="input editor" rows="14" spellcheck="false" placeholder="Hi John,&#10;&#10;Please confirm teh shipment date for PO 4500123. We need the containers arrive before Oct 20."></textarea>
+      <details class="sa-context">
+        <summary>对方来信（可选：粘贴在这里，AI 会参考上下文）</summary>
+        <textarea id="saContext" class="input" rows="7" spellcheck="false" placeholder="粘贴你要回复的那封邮件"></textarea>
+      </details>
+    </section>
+
+    <!-- 侧边栏（在 Outlook 里只显示这一部分） -->
+    <aside id="panel" class="panel">
+      <header class="top">
+        <div class="brand"><img src="icon-32.png" alt="" width="20" height="20"><span>邮件润色</span></div>
+        <button id="btnSettings" class="icon-btn" title="设置" aria-label="设置">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.48.48 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.48.48 0 0 0-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"/></svg>
+        </button>
+      </header>
+
+      <div id="notice" class="notice" hidden></div>
+
+      <div id="mainView">
+        <nav class="tabs" role="tablist">
+          <button class="tab active" data-tab="live" role="tab">边写边查</button>
+          <button class="tab" data-tab="full" role="tab">全文检查</button>
+          <button class="tab" data-tab="rewrite" role="tab">改写</button>
+        </nav>
+
+        <!-- 边写边查 -->
+        <section id="tab-live" class="tabpane">
+          <div class="row between">
+            <label class="switch"><input type="checkbox" id="liveToggle"><span class="slider"></span><span>自动检查</span></label>
+            <div id="liveStatus" class="status"><span class="dot"></span><span class="txt">准备中…</span></div>
+          </div>
+          <div id="liveBulk" class="notice mt" hidden></div>
+          <div id="liveCurrent" class="current" hidden></div>
+          <div id="liveCards"></div>
+          <p id="liveHint" class="hint">在邮件正文里写英文，停顿约 2 秒，会自动检查你刚写的那句话。邮件里原本就有的内容，请用「全文检查」。</p>
+          <details id="liveHistoryWrap" class="history" hidden>
+            <summary>最近检查过的句子（<span id="histCount">0</span>）</summary>
+            <div id="liveHistory"></div>
+          </details>
+        </section>
+
+        <!-- 全文检查 -->
+        <section id="tab-full" class="tabpane" hidden>
+          <button id="btnFull" class="btn primary block">检查整封邮件（我写的部分）</button>
+          <p class="hint">只检查你写的部分，不检查下面引用的往来邮件。</p>
+          <div id="fullOverall"></div>
+          <div id="fullCards"></div>
+        </section>
+
+        <!-- 改写 -->
+        <section id="tab-rewrite" class="tabpane" hidden>
+          <div class="field">
+            <div class="lbl">改写哪部分</div>
+            <div class="seg">
+              <label><input type="radio" name="rwSource" value="selection" checked><span>选中的文字</span></label>
+              <label><input type="radio" name="rwSource" value="all"><span>我写的全部内容</span></label>
+            </div>
+          </div>
+          <div class="field">
+            <div class="lbl">语气</div>
+            <div id="toneChips" class="chips"></div>
+          </div>
+          <div class="field">
+            <label class="lbl" for="scenario">场景</label>
+            <select id="scenario" class="input"></select>
+          </div>
+          <div class="field">
+            <label class="lbl" for="rwExtra">补充要求（可选，中英文都行）</label>
+            <textarea id="rwExtra" class="input" rows="2" placeholder="例如：提醒对方本周五前回复；语气别太强硬"></textarea>
+          </div>
+          <button id="btnRewrite" class="btn primary block">生成改写</button>
+          <p class="hint">可以直接用中文写意思，选中后点「生成改写」，会写成英文。</p>
+          <div id="rewriteResults"></div>
+        </section>
+      </div>
+
+      <!-- 设置 -->
+      <section id="settingsView" class="settings" hidden>
+        <h2>设置</h2>
+        <div class="field">
+          <label class="lbl" for="apiKey">DeepSeek API Key</label>
+          <div class="row gap">
+            <input id="apiKey" class="input" type="password" autocomplete="off" spellcheck="false" placeholder="sk-...">
+            <button id="btnShowKey" class="btn small ghost" type="button">显示</button>
+          </div>
+          <div class="row gap mt">
+            <button id="btnTest" class="btn small" type="button">测试连接</button>
+            <span id="testResult" class="muted"></span>
+          </div>
+          <p class="hint">Key 只保存在这台电脑上（这个插件自己的存储里），只会发送给下面的 API 地址。可在 platform.deepseek.com 创建。</p>
+        </div>
+        <div class="field">
+          <label class="lbl" for="model">模型</label>
+          <select id="model" class="input"></select>
+        </div>
+        <div class="field">
+          <label class="lbl" for="variant">英语习惯</label>
+          <select id="variant" class="input">
+            <option value="US">美式英语</option>
+            <option value="UK">英式英语</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="lbl" for="about">关于你（让 AI 的用词更贴合你的工作）</label>
+          <textarea id="about" class="input" rows="3" placeholder="例如：I work in supply chain at a frozen seafood importer. I email overseas suppliers and the distribution centers of US retail customers."></textarea>
+        </div>
+        <div class="field">
+          <label class="lbl" for="terms">专业术语 / 不要改的词（用逗号分隔，如产品名、公司名）</label>
+          <textarea id="terms" class="input" rows="3"></textarea>
+        </div>
+        <div class="field two">
+          <div>
+            <label class="lbl" for="pauseMs">停顿多久后自动检查</label>
+            <select id="pauseMs" class="input">
+              <option value="1500">1.5 秒</option>
+              <option value="2000">2 秒</option>
+              <option value="3000">3 秒</option>
+              <option value="5000">5 秒</option>
+            </select>
+          </div>
+          <div>
+            <label class="lbl" for="dailyCap">每天最多调用次数</label>
+            <input id="dailyCap" class="input" type="number" min="10" max="10000" step="10">
+          </div>
+        </div>
+        <details class="field">
+          <summary class="lbl">高级：API 地址 / 自定义模型名</summary>
+          <label class="lbl mt" for="baseUrl">API 地址</label>
+          <input id="baseUrl" class="input" spellcheck="false">
+          <label class="lbl mt" for="customModel">自定义模型名（留空则使用上面选择的模型）</label>
+          <input id="customModel" class="input" spellcheck="false" placeholder="例如 deepseek-flash">
+          <p class="hint">默认 https://api.deepseek.com 。以后想换成其它兼容 OpenAI 格式的服务，改这里的地址和模型名即可。</p>
+        </details>
+        <div class="privacy">
+          <b>隐私提示：</b>检查时会把你正在写的句子、邮件主题、以及对方来信的开头部分发送给 AI 服务。DeepSeek 的隐私政策写明数据在中国境内处理和存储，请确认这符合公司规定。
+        </div>
+        <div id="usageDetail" class="muted small mt"></div>
+        <div class="row gap mt">
+          <button id="btnSave" class="btn primary" type="button">保存</button>
+          <button id="btnCloseSettings" class="btn" type="button">返回</button>
+          <button id="btnClearKey" class="btn ghost danger" type="button">清除本机 Key</button>
+        </div>
+      </section>
+
+      <footer class="foot">
+        <span id="usage" class="muted small"></span>
+        <button id="btnUndo" class="btn small" hidden>撤销上次替换</button>
+      </footer>
+      <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    </aside>
+  </div>
+
+  <script src="textutil.js"></script>
+  <script src="ai.js"></script>
+  <script src="host.js"></script>
+  <script src="manifest.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
