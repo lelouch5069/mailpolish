@@ -249,3 +249,12 @@ textarea.input { resize: vertical; }
 .alt.in-use .text { color: var(--ok); }
 .alts .loading { padding: 6px 0; }
 .rw-wrap > .actions { margin-top: 4px; }
+
+/* ---------- v1.2：整封邮件「全部替换 / 撤销全部」操作栏 ---------- */
+.groupbar {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--bg); border: 1px solid var(--primary); border-radius: var(--radius);
+  padding: 8px 10px; margin: 8px 0; box-shadow: 0 2px 6px rgba(0, 0, 0, .08);
+}
+.groupbar > .actions { margin-top: 0; }
+.groupbar > .muted + .actions { margin-top: 6px; }

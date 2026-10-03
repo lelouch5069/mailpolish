@@ -7,7 +7,7 @@
   <title>MailPolish 邮件润色</title>
   <!-- 微软 Office.js（Outlook 插件必须从微软官方地址加载） -->
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-  <link rel="stylesheet" href="app.css?v=1.1.0">
+  <link rel="stylesheet" href="app.css?v=1.2.0">
   <link rel="icon" href="icon-32.png">
 </head>
 <body>
@@ -69,8 +69,9 @@
         <!-- 全文检查 -->
         <section id="tab-full" class="tabpane" hidden>
           <button id="btnFull" class="btn primary block">检查整封邮件（我写的部分）</button>
-          <p class="hint">只检查你写的部分，不检查下面引用的往来邮件。</p>
+          <p class="hint">只检查你写的部分，不检查下面引用的往来邮件和你的签名。查完可以一键「全部改正」，加粗、项目符号等格式不变。</p>
           <div id="fullOverall"></div>
+          <div id="fullBar" class="groupbar" hidden></div>
           <div id="fullCards"></div>
         </section>
 
@@ -80,7 +81,7 @@
             <div class="lbl">改写哪部分</div>
             <div class="seg">
               <label><input type="radio" name="rwSource" value="selection" checked><span>选中的文字</span></label>
-              <label><input type="radio" name="rwSource" value="all"><span>我写的全部内容</span></label>
+              <label><input type="radio" name="rwSource" value="all"><span>整封邮件（逐段改写，保留格式）</span></label>
             </div>
           </div>
           <div class="field">
@@ -96,9 +97,14 @@
             <textarea id="rwExtra" class="input" rows="2" placeholder="例如：提醒对方本周五前回复；语气别太强硬"></textarea>
           </div>
           <button id="btnRewrite" class="btn primary block">生成改写</button>
-          <p class="hint">可以直接用中文写意思，选中后点「生成改写」，会写成英文。</p>
+          <p class="hint">选中一句或一段：给出 2 个版本，可以直接用中文写意思。选中多段或选「整封邮件」：逐段改写，点「全部替换」直接改在邮件里，加粗、项目符号等格式不变；数据行和签名不会改。</p>
           <div id="rewriteMsg"></div>
           <div id="rewriteResults"></div>
+          <div id="rwBlock" hidden>
+            <div id="rwBlockHead"></div>
+            <div id="rwBar" class="groupbar" hidden></div>
+            <div id="rwCards"></div>
+          </div>
         </section>
       </div>
 
@@ -189,10 +195,10 @@
     </aside>
   </div>
 
-  <script src="textutil.js?v=1.1.0"></script>
-  <script src="ai.js?v=1.1.0"></script>
-  <script src="host.js?v=1.1.0"></script>
-  <script src="manifest.js?v=1.1.0"></script>
-  <script src="app.js?v=1.1.0"></script>
+  <script src="textutil.js?v=1.2.0"></script>
+  <script src="ai.js?v=1.2.0"></script>
+  <script src="host.js?v=1.2.0"></script>
+  <script src="manifest.js?v=1.2.0"></script>
+  <script src="app.js?v=1.2.0"></script>
 </body>
 </html>

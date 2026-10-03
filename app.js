@@ -8,11 +8,16 @@
  *
  * 每条建议是一张「卡片」，卡片记住自己的状态：
  *   待处理 → 点「替换」/「用这个」一键写回 → 已替换（可「撤销」，可「换个写法」再换）
+ *
+ * v1.2 整封邮件：
+ *   - 全文检查：「全部改正」「全部用更专业的写法」「撤销全部」，一次写回邮件
+ *   - 改写整封（或选中多段）：逐段改写，每段原地替换，加粗、项目符号、上标等格式不变
+ *   - 数据行（Tab 对齐的 SKU 清单）和签名不送去改；数字或术语有变化的建议不会被「全部替换」自动套用
  */
 (function () {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const TU = window.TextUtil;
   const AI = window.MailPolishAI;
   const HOSTS = window.MailPolishHost;
@@ -112,6 +117,8 @@
   }
 
   function errText(e) { return e && e.message ? e.message : String(e); }
+  /** 统一换行：Windows 的 \r\n、Word 的手动换行（\v）等都当成 \n */
+  function toLF(s) { return String(s || '').replace(/\r\n?|[\v\u2028\u2029]/g, '\n'); }
 
   // ---------------------------------------------------------------------------
   // 用量与费用（估算）
@@ -251,7 +258,9 @@
   // ---------------------------------------------------------------------------
   // 顶部提示条（也用来做"没有卡片可挂靠"时的确认）
   // ---------------------------------------------------------------------------
+  let noticeAskFinish = null; // 提示条上正在等回答的确认
   function showNotice(message, actions) {
+    if (noticeAskFinish) { const f = noticeAskFinish; noticeAskFinish = null; f(-1); } // 新提示顶掉了旧的确认：当作取消
     const n = $('#notice');
     clear(n);
     n.appendChild(el('div', {}, message));
@@ -260,43 +269,85 @@
     }
     n.hidden = false;
   }
-  function hideNotice() { $('#notice').hidden = true; }
+  function hideNotice() {
+    if (noticeAskFinish) { const f = noticeAskFinish; noticeAskFinish = null; f(-1); return; } // 提示条上还有没回答的确认：当作取消
+    $('#notice').hidden = true;
+  }
   function showSetupNotice() {
     showNotice('还没有填写 DeepSeek API Key。填好后就可以开始检查。', [['去设置', openSettings]]);
   }
-  function askInNotice(message, labels) {
-    return new Promise(resolve => {
-      showNotice(message, labels.map((label, i) => [label, () => { hideNotice(); resolve(i); }]));
+
+  // 等待用户回答的确认框（切换邮件时要全部取消，否则写入锁会一直占着）
+  const pendingAsks = new Set();
+  function cancelPendingAsks() {
+    Array.from(pendingAsks).forEach(fn => fn(-1));
+  }
+  function askVia(show, hide) {
+    return (message, labels) => new Promise(resolve => {
+      const finish = i => { pendingAsks.delete(finish); hide(); resolve(i); };
+      pendingAsks.add(finish);
+      show(message, labels, finish);
     });
   }
+  const askInNotice = askVia(
+    (message, labels, finish) => { showNotice(message, labels.map((label, i) => [label, () => finish(i)])); noticeAskFinish = finish; },
+    () => { noticeAskFinish = null; hideNotice(); });
+
+  /**
+   * 开始新的检查/改写前调用：还在等你确认的替换当作取消（那次还没写回邮件）；
+   * 如果正在写回邮件，就请你稍等，免得旧卡片被清掉后写回的结果对不上。
+   */
+  function abandonPendingWrites() {
+    if (pendingAsks.size) { cancelPendingAsks(); return true; }
+    if (writeLock) { toast('正在写回邮件，请稍等一下再试'); return false; }
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 写入锁：同一时间只做一件写回邮件的事，避免两次写回互相覆盖
+  // ---------------------------------------------------------------------------
+  let writeLock = false;
+  let itemSeq = 0; // 每切换一封邮件 +1，用来丢弃上一封邮件的迟到结果
+  function beginWrite() {
+    if (writeLock) { toast('上一个替换还没完成，请稍等一下'); return false; }
+    writeLock = true;
+    return true;
+  }
+  function endWrite() { writeLock = false; }
 
   // ---------------------------------------------------------------------------
   // 替换 / 撤销（统一处理"有图片时先确认"的设置）
   // ---------------------------------------------------------------------------
   const IMAGE_CONFIRM_TEXT = '这封邮件里有图片（比如签名或来信里的 logo）。直接替换需要把整个正文写回 Outlook。' +
     '替换后我会自动检查，图片变少就自动恢复原样。也可以先在邮件里选中这句话再替换，这样不会动到其它内容。';
+  const IMAGE_CONFIRM_MANY = '这封邮件里有图片（比如签名或来信里的 logo）。一次改多处需要把整个正文写回 Outlook。' +
+    '写回后我会自动检查，图片变少就自动恢复原样。';
+  const PER_ITEM_REASONS = new Set(['not_found', 'multiple', 'crosses_paragraph', 'empty']);
 
   function reasonText(reason, action) {
     const verb = action === 'undo' ? '撤销' : '替换';
     return ({
       not_found: '在正文里没找到这句（可能刚刚又改过）。可以在邮件里选中它，再点「' + verb + '」。',
-      multiple: '这句话在正文里出现了不止一次。请先在邮件里选中要改的那一处，再点「' + verb + '」。',
+      multiple: '这句话在你写的部分里出现了不止一次。请先在邮件里选中要改的那一处，再点「' + verb + '」。',
       crosses_paragraph: '这段文字跨了段落，没法自动定位。请先在邮件里选中它，再点「' + verb + '」。',
       empty: '没有可' + verb + '的内容。',
       has_images: '请先在邮件里选中这句话，再点「' + verb + '」。',
       image_lost: '写回正文后检测到图片变少了，已经自动恢复原样。请先在邮件里选中这句话再' + verb + '，或者在设置里改成「有图片时先确认」。',
-      text_lost: '写回正文后检测到内容不完整，已经自动恢复原样。请先在邮件里选中这句话再' + verb + '。'
+      text_lost: '写回正文后检测到内容不完整，已经自动恢复原样。请先在邮件里选中这句话再' + verb + '。',
+      changed_facts: '这条建议改动了数字、日期或术语，批量替换时没有自动套用。请核对后点这张卡片上的「替换」。',
+      suspicious: '这段改写和原文几乎没有相同的词，可能对应错了段落，批量替换时没有自动套用。请核对后点这张卡片上的「替换」。',
+      item_changed: '你切换到了另一封邮件，这次没有' + verb + '。'
     })[reason] || verb + '没有成功。';
   }
 
   /** ask(message, labels) → Promise<index> ：由调用方决定在卡片里问还是在顶部提示条里问 */
-  async function replaceWithPolicy(from, to, ask) {
+  async function replaceWithPolicy(from, to, ask, ctx) {
     const direct = settings.replaceMode !== 'confirm';
-    let r = await host.replaceSentence(from, to, { allowFullBody: direct });
+    let r = await host.replaceSentence(from, to, { allowFullBody: direct, ctx });
     if (!r.ok && r.reason === 'has_images') {
       const choice = await ask(IMAGE_CONFIRM_TEXT, ['直接替换', '我先去选中']);
       if (choice !== 0) return { ok: false, cancelled: true };
-      r = await host.replaceSentence(from, to, { allowFullBody: true });
+      r = await host.replaceSentence(from, to, { allowFullBody: true, ctx });
     }
     return r;
   }
@@ -308,6 +359,18 @@
       const choice = await ask(IMAGE_CONFIRM_TEXT, ['直接撤销', '我先去选中']);
       if (choice !== 0) return { ok: false, cancelled: true };
       r = await host.revertEntry(entry, { allowFullBody: true });
+    }
+    return r;
+  }
+
+  /** 一次改多处：pairs = [{ original, replacement, occurrence? }] */
+  async function replaceManyWithPolicy(pairs, ask, record, okLabel) {
+    const direct = settings.replaceMode !== 'confirm';
+    let r = await host.replaceMany(pairs, { allowFullBody: direct, record });
+    if (!r.ok && r.reason === 'has_images') {
+      const choice = await ask(IMAGE_CONFIRM_MANY, [okLabel, '取消']);
+      if (choice !== 0) return { ok: false, cancelled: true };
+      r = await host.replaceMany(pairs, { allowFullBody: true, record });
     }
     return r;
   }
@@ -334,14 +397,27 @@
   const cards = new Map();          // id -> 卡片
   const liveCardByKey = new Map();  // 原句 -> 卡片 id（边写边查）
   let fullCardIds = [];             // 全文检查的卡片
-  let rewriteCardId = null;         // 改写结果卡片
+  let rewriteCardId = null;         // 改写结果卡片（选中一句/一段时的多版本）
   let cardSeq = 0;
+
+  // 一组卡片（全文检查 / 逐段改写）的批量操作状态
+  const groups = {
+    full: { busy: false, confirm: null },
+    rwb: { busy: false, confirm: null }
+  };
+  function groupOf(card) {
+    if (card.source === 'full') return groups.full;
+    if (card.source === 'rewriteBlock') return groups.rwb;
+    return null;
+  }
+  function groupBusy(card) { const g = groupOf(card); return !!(g && g.busy); }
 
   function newCard(source, original, extra) {
     const card = Object.assign({
       id: 'c' + (++cardSeq), source, key: TU.sentenceKey(original), original, result: null,
       status: 'open', current: original, history: [], alts: null, altsSeen: [], altsRound: 0,
-      altsLoading: false, altsError: '', busy: false, confirm: null, paragraph: '', at: Date.now()
+      altsLoading: false, altsError: '', busy: false, confirm: null, paragraph: '', at: Date.now(),
+      ctx: null, failNote: ''
     }, extra || {});
     cards.set(card.id, card);
     return card;
@@ -362,40 +438,54 @@
   function rerender() {
     renderLive();
     renderFullCards();
-    renderRewriteCard();
+    renderRewrite();
   }
 
   /** 在卡片里问一个问题（状态保存在卡片上，界面刷新也不会丢） */
   function askInCard(card) {
-    return (message, labels) => new Promise(resolve => {
-      card.confirm = { message, labels, resolve: i => { card.confirm = null; rerender(); resolve(i); } };
-      rerender();
-    });
+    return askVia((message, labels, finish) => { card.confirm = { message, labels, resolve: finish }; rerender(); },
+      () => { card.confirm = null; rerender(); });
+  }
+  /** 在一组卡片上方的操作栏里问 */
+  function askInGroup(g) {
+    return askVia((message, labels, finish) => { g.confirm = { message, labels, resolve: finish }; rerender(); },
+      () => { g.confirm = null; rerender(); });
+  }
+
+  /** 替换成功后更新卡片状态（ctx：新文字在邮件里的前后文，下次撤销或再换写法时用来定位） */
+  function afterApplied(card, from, to, entry, ctx) {
+    if (entry) entry.cardId = card.id;
+    card.history.push({ from, to, entry });
+    card.current = to;
+    card.ctx = ctx || null;
+    card.status = 'applied';
+    card.failNote = '';
+    card.at = Date.now();
+    markApplied(to);
+    const orig = live.cache.get(card.key);
+    if (orig && orig.status !== 'applied') orig.status = 'replaced';
   }
 
   async function applyCard(card, newText) {
-    if (card.busy) return;
+    if (card.busy || groupBusy(card)) return;
     const from = card.current;
     if (TU.normalize(from) === TU.normalize(newText)) { toast('邮件里已经是这个写法了'); return; }
+    if (!beginWrite()) return;
     card.busy = true;
+    card.failNote = '';
     rerender();
     try {
-      const r = await replaceWithPolicy(from, newText, askInCard(card));
+      const r = await replaceWithPolicy(from, newText, askInCard(card), card.ctx);
       if (r.cancelled) return;
       if (!r.ok) { toast(reasonText(r.reason), 8000); return; }
-      if (r.entry) r.entry.cardId = card.id;
-      card.history.push({ from, to: newText, entry: r.entry });
-      card.current = newText;
-      card.status = 'applied';
-      card.at = Date.now();
-      markApplied(newText);
-      const orig = live.cache.get(card.key);
-      if (orig && orig.status !== 'applied') orig.status = 'replaced';
+      afterApplied(card, from, newText, r.entry, r.ctx);
+      if (card.source !== 'live') rebaseLive();
       updateUndo();
       toast(r.method === 'body' && inOutlook ? '已替换（光标可能会跳到正文开头）' : '已替换');
     } catch (e) {
       toast('替换失败：' + errText(e), 8000);
     } finally {
+      endWrite();
       card.busy = false;
       rerender();
     }
@@ -403,16 +493,19 @@
 
   async function undoCard(card) {
     const last = card.history[card.history.length - 1];
-    if (!last || card.busy) return;
+    if (!last || card.busy || groupBusy(card)) return;
+    if (!beginWrite()) return;
     card.busy = true;
     rerender();
     try {
       const entry = last.entry || { original: last.from, replacement: last.to, method: 'body' };
+      entry.ctx = card.ctx; // 用卡片最新记下的前后文找回这段文字
       const r = await revertWithPolicy(entry, askInCard(card));
       if (r.cancelled) return;
       if (!r.ok) { toast(reasonText(r.reason, 'undo'), 8000); return; }
       card.history.pop();
       card.current = last.from;
+      card.ctx = r.ctx || null;
       card.status = card.history.length ? 'applied' : 'open';
       card.at = Date.now();
       markPresent(last.from);
@@ -420,11 +513,13 @@
         const orig = live.cache.get(card.key);
         if (orig) orig.status = card.result ? 'issues' : 'ok';
       }
+      if (card.source !== 'live') rebaseLive();
       updateUndo();
       toast('已撤销');
     } catch (e) {
       toast('撤销失败：' + errText(e), 8000);
     } finally {
+      endWrite();
       card.busy = false;
       rerender();
     }
@@ -442,12 +537,162 @@
     rerender();
   }
 
+  // ---------------------------------------------------------------------------
+  // 一组卡片的批量操作：全部替换 / 撤销全部（只写回邮件一次）
+  // ---------------------------------------------------------------------------
+  let batchSeq = 0;
+  function pickCorrected(card) { return card.result && card.result.changed ? card.result.corrected : ''; }
+  function pickBetter(card) { return card.result ? (card.result.better || pickCorrected(card)) : ''; }
+
+  /** 这张卡片用 pick 选出的写法：'ok' 可以批量替换；'review' 要你核对（改了数字/术语，或和原文差别很大）；'' 没有可替换的 */
+  function batchKind(card, pick, terms) {
+    if (card.status !== 'open') return '';
+    const to = pick(card);
+    if (!to || TU.normalize(to) === TU.normalize(card.current)) return '';
+    if (isSuspicious(card, to)) return 'review';
+    return TU.invariantWarnings(card.current, to, terms).length ? 'review' : 'ok';
+  }
+  function isSuspicious(card, to) {
+    return !!(card.result && card.result.reviewOnly && to === card.result.corrected);
+  }
+  function countKind(list, pick, kind) {
+    const terms = TU.parseTerms(settings.terms);
+    return list.filter(c => batchKind(c, pick, terms) === kind).length;
+  }
+
+  async function applyGroup(g, list, pick, unit) {
+    const u = unit || '处';
+    if (g.busy) return;
+    const terms = TU.parseTerms(settings.terms);
+    const items = [];
+    const skipped = [];
+    list.forEach(card => {
+      if (card.busy) return;
+      const kind = batchKind(card, pick, terms);
+      // 改了数字、日期或术语的建议不自动套用，留给你在卡片上核对
+      if (kind === 'review') skipped.push(card);
+      else if (kind === 'ok') items.push({ card, to: pick(card) });
+    });
+    skipped.forEach(card => { card.failNote = reasonText(isSuspicious(card, pick(card)) ? 'suspicious' : 'changed_facts'); });
+    if (!items.length) {
+      toast(skipped.length ? '有 ' + skipped.length + ' ' + u + '需要你核对，请在卡片上看过后单独替换。' : '没有需要替换的内容', 6000);
+      rerender();
+      return;
+    }
+    if (!beginWrite()) return;
+    g.busy = true;
+    items.forEach(it => { it.card.busy = true; it.card.failNote = ''; });
+    rerender();
+    try {
+      const pairs = items.map(it => ({ original: it.card.current, replacement: it.to, ctx: it.card.ctx }));
+      const r = await replaceManyWithPolicy(pairs, askInGroup(g), true, '全部替换');
+      if (r.cancelled) return;
+      if (!r.results) { toast(reasonText(r.reason), 8000); return; }
+      const batchId = 'b' + (++batchSeq);
+      let okN = 0;
+      r.results.forEach((res, i) => {
+        const it = items[i];
+        if (res.ok) {
+          okN++;
+          if (res.entry) res.entry.batchId = batchId;
+          afterApplied(it.card, it.card.current, it.to, res.entry, res.ctx);
+        } else if (PER_ITEM_REASONS.has(res.reason)) {
+          it.card.failNote = reasonText(res.reason);
+        }
+      });
+      if (okN) { rebaseLive(); updateUndo(); }
+      const notDone = items.length - okN + skipped.length;
+      if (!okN) toast(PER_ITEM_REASONS.has(r.reason) ? '没能自动替换，原因写在卡片上。' : reasonText(r.reason), 8000);
+      else if (notDone) toast('已替换 ' + okN + ' ' + u + '；还有 ' + notDone + ' ' + u + '没有自动替换，原因写在那几张卡片上。', 8000);
+      else toast('已全部替换（' + okN + ' ' + u + '）' + (inOutlook ? '，光标可能会跳到正文开头' : '') + '。不满意可以点「撤销全部」。', 6000);
+    } catch (e) {
+      toast('替换失败：' + errText(e), 8000);
+    } finally {
+      endWrite();
+      g.busy = false;
+      items.forEach(it => { it.card.busy = false; });
+      rerender();
+    }
+  }
+
+  /** 一次撤销多张卡片：toOriginal=true 直接回到最初的原文；否则每张只退一步 */
+  async function revertCards(g, list, toOriginal, unit) {
+    const u = unit || '处';
+    if (g.busy) return;
+    const items = list.filter(c => c.status === 'applied' && c.history.length && !c.busy);
+    if (!items.length) { toast('没有可撤销的替换'); return; }
+    if (!beginWrite()) return;
+    g.busy = true;
+    items.forEach(c => { c.busy = true; });
+    rerender();
+    try {
+      const targets = items.map(c => (toOriginal ? c.history[0] : c.history[c.history.length - 1]).from);
+      const pairs = items.map((c, i) => ({ original: c.current, replacement: targets[i], ctx: c.ctx }));
+      const r = await replaceManyWithPolicy(pairs, askInGroup(g), false, '全部撤销');
+      if (r.cancelled) return;
+      if (!r.results) { toast(reasonText(r.reason, 'undo'), 8000); return; }
+      let okN = 0;
+      r.results.forEach((res, i) => {
+        if (!res.ok) return;
+        okN++;
+        const c = items[i];
+        const removed = toOriginal ? c.history.splice(0) : [c.history.pop()];
+        removed.forEach(h => { if (h.entry) host.removeUndo(h.entry); });
+        c.current = targets[i];
+        c.ctx = res.ctx || null;
+        c.status = c.history.length ? 'applied' : 'open';
+        c.at = Date.now();
+        markPresent(targets[i]);
+        if (!c.history.length) {
+          const orig = live.cache.get(c.key);
+          if (orig) orig.status = c.result ? 'issues' : 'ok';
+        }
+      });
+      if (okN) { rebaseLive(); updateUndo(); }
+      const failN = items.length - okN;
+      if (!okN) toast(reasonText(r.reason, 'undo'), 8000);
+      else if (failN) toast('已撤销 ' + okN + ' ' + u + '；还有 ' + failN + ' ' + u + '没找到（可能已经改过），可以在卡片上单独撤销。', 8000);
+      else toast('已撤销 ' + okN + ' ' + u, 4000);
+    } catch (e) {
+      toast('撤销失败：' + errText(e), 8000);
+    } finally {
+      endWrite();
+      g.busy = false;
+      items.forEach(c => { c.busy = false; });
+      rerender();
+    }
+  }
+
+  /** 卡片上方的操作栏（全部替换 / 撤销全部 等）。buttons: [[文字, 样式, 点击]] */
+  function renderGroupBar(box, g, buttons, info, extraDisabled) {
+    const disabled = g.busy || !!extraDisabled;
+    const sig = [buttons.map(b => b[0] + '|' + b[1]).join('\u0003'), disabled ? 1 : 0, g.busy ? 1 : 0,
+      g.confirm ? g.confirm.message : '', info || ''].join('\u0001');
+    if (box.dataset.sig === sig) return;
+    box.dataset.sig = sig;
+    clear(box);
+    if (info) box.appendChild(el('div', { class: 'muted small' }, info));
+    if (buttons.length) {
+      box.appendChild(el('div', { class: 'actions' },
+        buttons.map(([label, kind, fn]) => btn(label, kind, fn, disabled)),
+        g.busy ? el('span', { class: 'muted small' }, el('span', { class: 'spinner' }), ' 处理中…') : null));
+    }
+    if (g.confirm) {
+      const c = g.confirm;
+      box.appendChild(el('div', { class: 'confirm' },
+        el('div', {}, c.message),
+        el('div', { class: 'actions' }, c.labels.map((label, i) => btn(label, i === 0 ? 'primary' : '', () => c.resolve(i))))));
+    }
+    box.hidden = !box.firstChild;
+  }
+
   /** 「换个写法」：让 AI 给 3 种不同写法（避开之前给过的） */
   async function loadAlternatives(card) {
     if (card.altsLoading) return;
     if (!settings.apiKey) { showSetupNotice(); return; }
     card.altsLoading = true;
     card.altsError = '';
+    const seq = itemSeq;
     rerender();
     try {
       const meta = await host.getMeta();
@@ -461,6 +706,7 @@
       const ctx = { subject: meta.subject, composeType: meta.composeType, quoted: live.quoted || fullState.quoted || '', paragraph: card.paragraph };
       const req = AI.buildAlternativesRequest(card.original, ctx, settings, uniq);
       const r = await callAI(Object.assign({}, req, { timeoutMs: 45000 }));
+      if (seq !== itemSeq) return; // 期间切换了邮件，结果作废
       const alts = AI.normalizeAlternatives(r.json, card.original, settings);
       card.altsSeen = card.altsSeen.concat((card.alts || []).map(a => a.text));
       card.alts = alts;
@@ -475,8 +721,8 @@
   }
 
   function cardSignature(card, focus) {
-    return [card.id, card.status, card.busy ? 1 : 0, card.current, card.history.length, card.altsLoading ? 1 : 0,
-      card.altsRound, card.altsError, card.confirm ? card.confirm.message : '', focus ? 1 : 0,
+    return [card.id, card.status, card.busy ? 1 : 0, groupBusy(card) ? 1 : 0, card.current, card.history.length, card.altsLoading ? 1 : 0,
+      card.altsRound, card.altsError, card.confirm ? card.confirm.message : '', focus ? 1 : 0, card.failNote,
       card.result ? card.result.corrected + card.result.better : '', card.versions ? card.versionsRound : '',
       card.source === 'rewrite' && rwRunning ? 'running' : ''].join('\u0001');
   }
@@ -501,7 +747,7 @@
   function renderAlternatives(card) {
     if (!card.altsLoading && !card.alts && !card.altsError) return null;
     const box = el('div', { class: 'alts' }, el('div', { class: 'cap' }, '其他写法'));
-    const busy = card.busy || card.altsLoading;
+    const busy = card.busy || card.altsLoading || groupBusy(card);
     if (card.altsError) box.appendChild(el('div', { class: 'warn' }, card.altsError));
     (card.alts || []).forEach(a => {
       const inUse = TU.normalize(a.text) === TU.normalize(card.current);
@@ -518,19 +764,19 @@
     return box;
   }
 
-  /** 一张建议卡片（边写边查和全文检查共用） */
+  /** 一张建议卡片（边写边查、全文检查、逐段改写共用） */
   function renderCard(card, focus) {
     const res = card.result || { issues: [], warnings: [], changed: false, corrected: card.original, better: '', betterWarnings: [], betterExplain: '' };
     const applied = card.status === 'applied';
-    const busy = card.busy;
+    const busy = card.busy || groupBusy(card);
     const box = el('div', { class: 'card' + (focus ? ' focus' : '') + (applied ? ' is-applied' : '') });
     const types = Array.from(new Set(res.issues.map(i => i.type)));
 
     box.appendChild(el('div', { class: 'card-head' },
       focus ? el('span', { class: 'chip badge' }, '正在写的句子') : null,
       applied ? el('span', { class: 'chip ok' }, '✓ 已替换') : types.map(t => el('span', { class: 'chip t-' + t }, AI.ISSUE_TYPES[t] || t)),
-      !applied && !types.length ? el('span', { class: 'chip t-tone' }, '表达') : null,
-      busy ? el('span', { class: 'muted small' }, el('span', { class: 'spinner' }), ' 处理中') : null));
+      !applied && !types.length ? el('span', { class: 'chip t-tone' }, card.source === 'rewriteBlock' ? '改写' : '表达') : null,
+      card.busy ? el('span', { class: 'muted small' }, el('span', { class: 'spinner' }), ' 处理中') : null));
 
     if (applied) {
       box.appendChild(el('div', { class: 'diff' }, diffNodes(card.original, card.current)));
@@ -548,6 +794,7 @@
           i.explain ? el('span', { class: 'why' }, '　' + i.explain) : null))));
       }
       res.warnings.forEach(w => box.appendChild(el('div', { class: 'warn' }, '⚠ ' + w)));
+      if (card.failNote) box.appendChild(el('div', { class: 'warn' }, card.failNote));
       box.appendChild(el('div', { class: 'actions' },
         res.changed ? btn('替换', 'primary', () => applyCard(card, res.corrected), busy) : null,
         btn('换个写法', '', () => loadAlternatives(card), busy || card.altsLoading),
@@ -575,6 +822,7 @@
   const live = {
     timer: null,
     busy: false,
+    gen: 0,                  // 每次批量改动正文后 +1，丢弃改动前读到的旧内容
     prevMine: null,          // 上一次读到的「我写的部分」
     quoted: '',              // 引用的往来邮件（作为上下文）
     lastChangeAt: 0,
@@ -595,8 +843,25 @@
     return new Set(TU.segmentSentences(text).map(s => TU.sentenceKey(s.text)));
   }
 
+  /**
+   * 插件自己改了正文（全文检查、改写、撤销）之后调用：
+   * 让「边写边查」重新记一次底稿，不把这些改动当成你新写的内容去检查（省钱，也不会冒出多余的卡片）。
+   */
+  function rebaseLive() {
+    live.prevMine = null;
+    const gen = ++live.gen;
+    // 马上读一次新底稿（不等下一轮），之后你再打字或粘贴都能正常识别
+    host.getDraft().then(draft => {
+      if (gen !== live.gen || live.prevMine !== null) return;
+      live.prevMine = draft.mine || '';
+      live.present = presentKeys(live.prevMine);
+      for (const k of Array.from(live.dirty.keys())) if (!live.present.has(k)) live.dirty.delete(k);
+    }).catch(() => { /* 读不到就等下一轮定时读取 */ });
+  }
+
   function resetLive() {
     live.prevMine = null;
+    live.gen += 1;
     live.quoted = '';
     live.lastChangeAt = 0;
     live.dirty.clear();
@@ -651,17 +916,20 @@
   }
 
   async function liveTick() {
-    if (live.busy) return;
+    if (live.busy || writeLock) return; // 插件自己正在写回邮件时不读，免得把插件的改动当成你在打字
     live.busy = true;
+    const gen = live.gen;
     try {
       const draft = await host.getDraft();
+      if (gen !== live.gen || writeLock) return; // 读取期间插件改过（或正在改）正文，这次读到的内容不算
       if (live.hostError) { live.hostError = false; setLiveStatus('idle'); }
       const mine = draft.mine || '';
       live.quoted = draft.quoted || '';
 
-      if (live.prevMine === null) { // 第一次读取：记下现有内容，不主动检查
+      if (live.prevMine === null) { // 第一次读取（或刚批量改过正文）：记下现有内容，不主动检查
         live.prevMine = mine;
         live.present = presentKeys(mine);
+        for (const k of Array.from(live.dirty.keys())) if (!live.present.has(k)) live.dirty.delete(k);
         renderLive();
         return;
       }
@@ -732,12 +1000,14 @@
     renderLive();
     const sentences = items.map((it, i) => ({ id: i + 1, text: it.text }));
     const paragraph = live.focusPara;
+    const seq = itemSeq;
     try {
       const meta = await host.getMeta();
       const req = AI.buildCheckRequest(sentences, {
         subject: meta.subject, composeType: meta.composeType, quoted: live.quoted, paragraph
       }, settings, 'live');
       const r = await callAI(Object.assign({}, req, { timeoutMs: 30000 }));
+      if (seq !== itemSeq) return; // 期间切换了邮件，结果作废
       const out = AI.normalizeCheckResult(r.json, sentences, settings);
       const byId = new Map(out.results.map(x => [x.id, x]));
       sentences.forEach((s, i) => {
@@ -877,23 +1147,40 @@
 
   function updateUndo() { $('#btnUndo').hidden = !(host && host.canUndo()); }
 
-  /** 底部「撤销上次替换」：撤销最近一次替换（属于哪张卡片就交给那张卡片处理） */
+  /** 底部「撤销上次替换」：撤销最近一次替换（属于哪张卡片就交给那张卡片处理；「全部替换」的一批就整批撤销） */
   async function onUndo() {
     const top = host.lastUndo();
     if (!top) { updateUndo(); return; }
+    if (top.batchId) {
+      const batch = Array.from(cards.values()).filter(c => {
+        const h = c.history[c.history.length - 1];
+        return (c.status === 'applied' || c.status === 'dismissed') && h && h.entry && h.entry.batchId === top.batchId;
+      });
+      if (batch.length) {
+        const g = groupOf(batch[0]) || groups.full;
+        if (g.busy) { toast('正在处理，请稍等一下'); return; }
+        batch.forEach(c => { if (c.status === 'dismissed') c.status = 'applied'; });
+        switchTab(g === groups.rwb ? 'rewrite' : 'full'); // 万一要确认，确认框在那个页面上
+        await revertCards(g, batch, false, g === groups.rwb ? '段' : '处');
+        return;
+      }
+    }
     const card = top.cardId ? cards.get(top.cardId) : null;
     if (card && card.history.length && card.history[card.history.length - 1].entry === top) {
       if (card.status === 'dismissed') card.status = 'applied';
       await undoCard(card);
       return;
     }
+    if (!beginWrite()) return;
     try {
       const r = await revertWithPolicy(top, askInNotice);
       if (r.cancelled) return;
+      if (r.ok) rebaseLive();
       toast(r.ok ? '已撤销' : reasonText(r.reason, 'undo'), r.ok ? 3000 : 8000);
     } catch (e) {
       toast('撤销失败：' + errText(e), 8000);
     } finally {
+      endWrite();
       updateUndo();
       rerender();
     }
@@ -908,31 +1195,41 @@
     if (fullState.running) return;
     if (!host.isCompose()) { toast('请在写邮件或回复时使用'); return; }
     if (!settings.apiKey) { showSetupNotice(); return; }
+    if (!abandonPendingWrites()) return;
+    const seq = itemSeq;
     fullState.running = true;
     const done = setBusy($('#btnFull'), '正在检查…');
     const ov = $('#fullOverall');
     clear(ov);
     fullCardIds.forEach(id => cards.delete(id));
     fullCardIds = [];
+    groups.full.confirm = null;
     renderFullCards();
     try {
       const draft = await host.getDraft();
       const meta = await host.getMeta();
       fullState.quoted = draft.quoted || '';
-      const seen = new Set();
-      let sentences = TU.segmentSentences(draft.mine).filter(s => {
-        if (!TU.isCheckableEnglish(s.text)) return false;
+      const mine = toLF(draft.mine);
+      // 签名（Best Regards 之后）不检查
+      const sigAt = TU.findSignatureStart(mine);
+      const body = sigAt >= 0 ? mine.slice(0, sigAt) : mine;
+      // 同一句只问 AI 一次；在邮件里出现几次，就有几张卡片（各改各的那一处）
+      const uniq = [];
+      const where = new Map();
+      TU.segmentSentences(body).forEach(s => {
+        if (!TU.isCheckableEnglish(s.text)) return;
         const k = TU.sentenceKey(s.text);
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
+        if (!where.has(k)) { where.set(k, []); uniq.push(s); }
+        where.get(k).push(s);
       });
-      if (!sentences.length) { ov.appendChild(el('p', { class: 'hint' }, '没有找到需要检查的英文句子。')); return; }
+      if (!uniq.length) { ov.appendChild(el('p', { class: 'hint' }, '没有找到需要检查的英文句子。')); return; }
       let note = '';
+      let sentences = uniq;
       if (sentences.length > 60) { sentences = sentences.slice(0, 60); note = '内容较长，这次只检查了前 60 句。'; }
       const list = sentences.map((s, i) => ({ id: i + 1, text: s.text }));
       const req = AI.buildCheckRequest(list, { subject: meta.subject, composeType: meta.composeType, quoted: draft.quoted }, settings, 'full');
       const r = await callAI(Object.assign({}, req, { timeoutMs: 120000 }));
+      if (seq !== itemSeq) return; // 期间切换了邮件，结果作废
       const out = AI.normalizeCheckResult(r.json, list, settings);
       // 记住结果，边写边查时就不会再重复检查这些句子
       list.forEach(s => {
@@ -941,12 +1238,17 @@
         const prev = live.cache.get(key);
         if (!prev || prev.source !== 'live') live.cache.set(key, { status: res ? 'issues' : 'ok', result: res, text: s.text, at: Date.now(), source: 'full' });
       });
-      out.results.forEach(res => fullCardIds.push(newCard('full', res.original, { result: res }).id));
+      out.results.forEach(res => {
+        const spots = where.get(TU.sentenceKey(res.original)) || [];
+        if (!spots.length) { fullCardIds.push(newCard('full', res.original, { result: res }).id); return; }
+        spots.forEach(s => fullCardIds.push(newCard('full', res.original, { result: res, ctx: TU.contextAt(mine, s.start, s.end) }).id));
+      });
       ov.appendChild(el('div', { class: 'overall' },
         el('div', { class: 'cap' }, '整体评价'),
         el('div', {}, out.overall || '（AI 没有给出整体评价）'),
         el('div', { class: 'muted small mt' },
-          '检查了 ' + list.length + ' 句，' + (out.results.length ? '有 ' + out.results.length + ' 句可以改进。' : '没有发现需要修改的地方。') + (note ? ' ' + note : ''))));
+          '检查了 ' + list.length + ' 句，' + (out.results.length ? '有 ' + out.results.length + ' 句可以改进。' : '没有发现需要修改的地方。') +
+          (sigAt >= 0 ? ' 签名部分没有检查。' : '') + (note ? ' ' + note : ''))));
       if (!out.results.length) ov.appendChild(el('div', { class: 'allgood' }, '✓ 没有发现问题'));
       renderFullCards();
       live.bulkHint = false;
@@ -960,18 +1262,34 @@
     }
   }
 
+  function fullCards() { return fullCardIds.map(id => cards.get(id)).filter(Boolean); }
+
   function renderFullCards() {
-    const items = fullCardIds.map(id => cards.get(id))
-      .filter(c => c && c.status !== 'ignored' && c.status !== 'dismissed')
-      .map(card => ({ card, focus: false }));
+    const list = fullCards();
+    const nFix = countKind(list, pickCorrected, 'ok');
+    const hasBetter = list.some(c => c.status === 'open' && c.result && c.result.better);
+    const nBetter = countKind(list, pickBetter, 'ok');
+    const terms = TU.parseTerms(settings.terms);
+    const nReview = list.filter(c => batchKind(c, pickCorrected, terms) === 'review' || batchKind(c, pickBetter, terms) === 'review').length;
+    const nApplied = list.filter(c => c.status === 'applied').length;
+    const buttons = [];
+    if (nFix) buttons.push(['全部改正（' + nFix + ' 处）', 'primary', () => applyGroup(groups.full, fullCards(), pickCorrected)]);
+    if (hasBetter && nBetter) buttons.push(['全部用更专业的写法（' + nBetter + ' 处）', nFix ? '' : 'primary', () => applyGroup(groups.full, fullCards(), pickBetter)]);
+    if (nApplied) buttons.push(['撤销全部（' + nApplied + ' 处）', '', () => revertCards(groups.full, fullCards(), true)]);
+    const info = nReview && list.length ? nReview + ' 处建议需要你核对（改动了数字、日期或术语），不会被批量替换。' : '';
+    renderGroupBar($('#fullBar'), groups.full, buttons, info);
+    const items = list.filter(c => c.status !== 'ignored' && c.status !== 'dismissed').map(card => ({ card, focus: false }));
     renderInto($('#fullCards'), items, renderCard);
   }
 
   // ---------------------------------------------------------------------------
   // 改写
+  //   选中一句或一段 → 给 2 个版本（可以从中文写成英文）
+  //   选中多段，或「整封邮件」→ 逐段改写，每段一张卡片，「全部替换」原地改，格式不变
   // ---------------------------------------------------------------------------
   let rwTone = 'formal';
   let rwRunning = false;
+  let rwBlock = null; // 逐段改写：{ source, blocks, cardByBlock, seen, notes, info }
 
   function buildRewriteControls() {
     const chips = $('#toneChips');
@@ -990,44 +1308,70 @@
     if (msg) out.appendChild(el('div', { class: 'warn' }, msg));
   }
 
-  /** 生成改写。regenerate=true 时沿用上一次的原文，并要求 AI 写得和之前的版本不一样 */
+  /** 清掉改写页上一次的结果（两种模式都清） */
+  function clearRewriteResults() {
+    if (rewriteCardId) cards.delete(rewriteCardId);
+    rewriteCardId = null;
+    if (rwBlock) rwBlock.cardByBlock.forEach(id => cards.delete(id));
+    rwBlock = null;
+    groups.rwb.confirm = null;
+  }
+
+  /** 值得改写的一段：不是数据行；至少 2 个英文单词，或者含中文 */
+  function isRewritableBlock(text) {
+    if (TU.isTableLike(text)) return false;
+    const words = (String(text).match(/[A-Za-z][A-Za-z'’-]*/g) || []).length;
+    return words >= 2 || /[㐀-鿿豈-﫿]/.test(text);
+  }
+
+  /** 生成改写。regenerate=true 时沿用上一次的原文，并要求 AI 写得和之前的不一样 */
   async function runRewrite(regenerate) {
     if (rwRunning) return;
     rewriteNotice('');
     if (!host.isCompose()) { rewriteNotice('请在写邮件或回复时使用。'); return; }
     if (!settings.apiKey) { showSetupNotice(); return; }
-    const prevCard = rewriteCardId ? cards.get(rewriteCardId) : null;
-    let text = '';
-    let source = 'selection';
-    if (regenerate && prevCard) {
-      text = prevCard.original;
-      source = prevCard.rwSource;
-    } else {
-      const sourceInput = document.querySelector('input[name="rwSource"]:checked');
-      source = sourceInput ? sourceInput.value : 'selection';
-      try {
-        if (source === 'selection') {
-          try { text = await host.getSelectedText(); } catch (e) { text = ''; } // 光标在收件人/主题栏时会读不到
-          if (!text.trim()) { rewriteNotice('请先在邮件正文里选中要改写的文字（可以是中文），再点「生成改写」。'); return; }
-        } else {
-          text = ((await host.getDraft()).mine || '').trim();
-          if (!text) { rewriteNotice('邮件里还没有你写的内容。'); return; }
-        }
-      } catch (e) {
-        rewriteNotice('读取邮件内容失败：' + errText(e));
-        return;
-      }
+    if (groups.rwb.busy) { toast('正在写回邮件，请稍等一下再试'); return; }
+    if (!abandonPendingWrites()) return;
+    if (regenerate) {
+      if (rwBlock) return runBlockRewrite('', rwBlock.source, true);
+      const prevCard = rewriteCardId ? cards.get(rewriteCardId) : null;
+      if (prevCard) return runVersionsRewrite(prevCard.original, prevCard.rwSource, true);
+      return;
     }
+    const sourceInput = document.querySelector('input[name="rwSource"]:checked');
+    const source = sourceInput ? sourceInput.value : 'selection';
+    let text = '';
+    try {
+      if (source === 'selection') {
+        try { text = await host.getSelectedText(); } catch (e) { text = ''; } // 光标在收件人/主题栏时会读不到
+        if (!text.trim()) { rewriteNotice('请先在邮件正文里选中要改写的文字（可以是中文），再点「生成改写」。想改整封邮件，请在上面选「整封邮件」。'); return; }
+      } else {
+        text = (await host.getDraft()).mine || '';
+        if (!text.trim()) { rewriteNotice('邮件里还没有你写的内容。'); return; }
+      }
+    } catch (e) {
+      rewriteNotice('读取邮件内容失败：' + errText(e));
+      return;
+    }
+    if (source === 'all' || TU.splitBlocks(toLF(text)).length >= 2) return runBlockRewrite(text, source, false);
+    return runVersionsRewrite(text.trim(), source, false);
+  }
 
+  /** 选中一句/一段：给 2 个版本 */
+  async function runVersionsRewrite(text, source, regenerate) {
+    const prevCard = rewriteCardId ? cards.get(rewriteCardId) : null;
     rwRunning = true;
+    const seq = itemSeq;
     const done = setBusy($('#btnRewrite'), '正在改写…');
-    if (prevCard && regenerate) { prevCard.busy = true; renderRewriteCard(); }
+    if (prevCard && regenerate) prevCard.busy = true;
+    renderRewrite();
     try {
       const draft = await host.getDraft();
       const meta = await host.getMeta();
       const avoid = regenerate && prevCard ? prevCard.versionsSeen.concat(prevCard.versions.map(v => v.text)) : [];
       const req = AI.buildRewriteRequest(text, { subject: meta.subject, quoted: draft.quoted }, settings, rwTone, $('#scenario').value, $('#rwExtra').value, avoid);
       const r = await callAI(Object.assign({}, req, { timeoutMs: 120000 }));
+      if (seq !== itemSeq) return; // 期间切换了邮件，结果作废
       const res = AI.normalizeRewriteResult(r.json, text, settings);
       if (regenerate && prevCard) {
         prevCard.versionsSeen = avoid;
@@ -1035,7 +1379,7 @@
         prevCard.notes = res.notes;
         prevCard.versionsRound += 1;
       } else {
-        if (prevCard) cards.delete(prevCard.id);
+        clearRewriteResults();
         const card = newCard('rewrite', text, { versions: res.versions, notes: res.notes, versionsSeen: [], versionsRound: 1, rwSource: source });
         rewriteCardId = card.id;
       }
@@ -1046,14 +1390,137 @@
       if (prevCard) prevCard.busy = false;
       rwRunning = false;
       done();
-      renderRewriteCard();
+      rerender();
     }
   }
 
-  function renderRewriteCard() {
-    const out = $('#rewriteResults');
+  /**
+   * 逐段改写：每一行（标题、项目符号、段落）一段，AI 一段对一段地改。
+   * 重新生成时：已经替换或忽略的段落保持不变，其余段落重新改写，并告诉 AI 避开之前的写法。
+   */
+  async function runBlockRewrite(text, source, regenerate) {
+    const prev = regenerate ? rwBlock : null;
+    let list;
+    let info = '';
+    if (prev) {
+      list = prev.blocks.filter(b => {
+        const c = cards.get(prev.cardByBlock.get(b.id));
+        return !(c && (c.status === 'applied' || c.status === 'ignored' || c.history.length));
+      });
+      if (!list.length) { rewriteNotice('所有建议都已经替换或忽略了。不满意可以先点「撤销全部」，再重新生成。'); return; }
+    } else {
+      const src = toLF(text);
+      const candidates = TU.splitBlocks(src, { excludeSignature: source === 'all' }).filter(b => isRewritableBlock(b.text));
+      if (!candidates.length) { rewriteNotice('没有找到需要改写的内容（数据行和签名不会改写）。'); return; }
+      const kept = [];
+      let total = 0;
+      for (const b of candidates) {
+        if (kept.length >= 80 || (kept.length && total + b.text.length > 9000)) break;
+        kept.push(b);
+        total += b.text.length;
+      }
+      if (kept.length < candidates.length) info = '内容较长，这次只改写了前 ' + kept.length + ' 段。';
+      list = kept.map((b, i) => ({
+        id: i + 1,
+        text: b.text,
+        ctx: source === 'all' ? TU.contextAt(src, b.start, b.end) : null,
+        around: [kept[i - 1], b, kept[i + 1]].filter(Boolean).map(x => x.text).join('\n')
+      }));
+    }
+    // 之前给过的写法（重新生成时避开）
+    const avoidFor = b => {
+      if (!prev) return [];
+      const c = cards.get(prev.cardByBlock.get(b.id));
+      return (prev.seen.get(b.id) || []).concat(c && c.result ? [c.result.corrected] : []);
+    };
+
+    rwRunning = true;
+    const seq = itemSeq;
+    const done = setBusy($('#btnRewrite'), '正在改写…');
+    const lockedGroup = !!rwBlock; // 改写期间旧卡片不能点（结果回来会替换掉它们）
+    if (lockedGroup) groups.rwb.busy = true;
+    rerender();
+    try {
+      const draft = await host.getDraft();
+      const meta = await host.getMeta();
+      const avoid = [].concat.apply([], list.map(avoidFor));
+      const req = AI.buildBlockRewriteRequest(list, { subject: meta.subject, quoted: draft.quoted }, settings, rwTone, $('#scenario').value, $('#rwExtra').value, avoid);
+      const r = await callAI(Object.assign({}, req, { timeoutMs: 180000 }));
+      if (seq !== itemSeq) return; // 期间切换了邮件，结果作废
+      const out = AI.normalizeBlockRewrite(r.json, list, settings);
+      const byId = new Map(out.results.map(x => [x.id, x]));
+      let state = prev;
+      if (!state) {
+        clearRewriteResults();
+        state = rwBlock = { source, blocks: list, cardByBlock: new Map(), seen: new Map(), notes: '', info };
+      }
+      list.forEach(b => {
+        if (prev) state.seen.set(b.id, avoidFor(b).slice(-3));
+        const old = cards.get(state.cardByBlock.get(b.id));
+        if (old) cards.delete(old.id);
+        state.cardByBlock.delete(b.id);
+        const res = byId.get(b.id);
+        if (res) state.cardByBlock.set(b.id, newCard('rewriteBlock', b.text, { result: res, ctx: b.ctx, paragraph: b.around }).id);
+      });
+      state.notes = out.notes;
+      if (prev && !out.results.length) toast('AI 这次没有给出新的写法，可以换个语气或补充要求再试。', 6000);
+    } catch (e) {
+      rewriteNotice(AI.describeError(e));
+      if (e && e.kind === 'no_key') showSetupNotice();
+    } finally {
+      if (lockedGroup) groups.rwb.busy = false;
+      rwRunning = false;
+      done();
+      rerender();
+    }
+  }
+
+  function rwBlockCards() {
+    if (!rwBlock) return [];
+    return rwBlock.blocks.map(b => cards.get(rwBlock.cardByBlock.get(b.id))).filter(Boolean);
+  }
+
+  function renderRewrite() {
     const card = rewriteCardId ? cards.get(rewriteCardId) : null;
-    renderInto(out, card ? [{ card, focus: false }] : [], renderRewriteBody);
+    renderInto($('#rewriteResults'), card ? [{ card, focus: false }] : [], renderRewriteBody);
+    renderBlockRewrite();
+  }
+
+  function renderBlockRewrite() {
+    const wrap = $('#rwBlock');
+    const head = $('#rwBlockHead');
+    wrap.hidden = !rwBlock;
+    if (!rwBlock) {
+      clear(head);
+      head.dataset.sig = '';
+      renderGroupBar($('#rwBar'), groups.rwb, [], '');
+      renderInto($('#rwCards'), [], renderCard);
+      return;
+    }
+    const list = rwBlockCards();
+    const skipNote = rwBlock.source === 'all' ? '数据行（如 SKU 清单）和签名不会改动。' : '数据行（如 SKU 清单）不会改动。';
+    const summary = '共 ' + rwBlock.blocks.length + ' 段，' + (list.length ? list.length + ' 段有改写建议。' : 'AI 认为都不需要修改。') +
+      skipNote + (rwBlock.info ? ' ' + rwBlock.info : '');
+    const sig = rwBlock.notes + '\u0001' + summary;
+    if (head.dataset.sig !== sig) {
+      head.dataset.sig = sig;
+      clear(head);
+      head.appendChild(el('div', { class: 'overall' },
+        el('div', { class: 'cap' }, '逐段改写'),
+        rwBlock.notes ? el('div', {}, rwBlock.notes) : null,
+        el('div', { class: 'muted small mt' }, summary)));
+    }
+    const nOpen = countKind(list, pickCorrected, 'ok');
+    const nReview = countKind(list, pickCorrected, 'review');
+    const nApplied = list.filter(c => c.status === 'applied').length;
+    const buttons = [];
+    if (nOpen) buttons.push(['全部替换（' + nOpen + ' 段）', 'primary', () => applyGroup(groups.rwb, rwBlockCards(), pickCorrected, '段')]);
+    if (nApplied) buttons.push(['撤销全部（' + nApplied + ' 段）', '', () => revertCards(groups.rwb, rwBlockCards(), true, '段')]);
+    buttons.push(['都不满意，重新生成', '', () => runRewrite(true)]);
+    const info = nReview ? nReview + ' 段需要你核对（改动了数字、日期、术语，或和原文差别很大），不会被批量替换。' : '';
+    renderGroupBar($('#rwBar'), groups.rwb, buttons, info, rwRunning);
+    const items = list.filter(c => c.status !== 'ignored' && c.status !== 'dismissed').map(c => ({ card: c, focus: false }));
+    renderInto($('#rwCards'), items, renderCard);
   }
 
   function renderRewriteBody(card) {
@@ -1079,16 +1546,14 @@
       el('summary', {}, '原文（想恢复时也可以复制回去）'),
       el('div', { class: 'rw-text' }, card.original),
       el('div', { class: 'actions' }, btn('复制原文', 'ghost', () => copyWithToast(card.original, '已复制原文')))));
-    if (card.rwSource === 'all' && card.status !== 'applied') {
-      wrap.appendChild(el('p', { class: 'hint' }, '整封改写：如果一键替换提示定位不到，请先在邮件里选中你写的部分，再点「替换选中内容」。'));
-    }
     return wrap;
   }
 
   async function applyRewrite(card, text) {
     if (card.busy) return;
+    if (!beginWrite()) return;
     card.busy = true;
-    renderRewriteCard();
+    renderRewrite();
     try {
       const from = card.current;
       let r;
@@ -1109,15 +1574,18 @@
       if (r.entry) r.entry.cardId = card.id;
       card.history.push({ from: r.entry ? r.entry.original : from, to: text, entry: r.entry });
       card.current = text;
+      card.ctx = r.ctx || null;
       card.status = 'applied';
       markApplied(text);
+      rebaseLive();
       updateUndo();
       toast('已替换。不满意可以点「撤销」，或者换另一个版本。', 5000);
     } catch (e) {
       toast('替换失败：' + errText(e), 8000);
     } finally {
+      endWrite();
       card.busy = false;
-      renderRewriteCard();
+      renderRewrite();
     }
   }
 
@@ -1150,13 +1618,15 @@
   }
 
   function onItemChanged() {
+    itemSeq += 1;
+    cancelPendingAsks();
     host.reset();
     resetLive();
     clear($('#fullOverall'));
     fullCardIds.forEach(id => cards.delete(id));
     fullCardIds = [];
-    if (rewriteCardId) cards.delete(rewriteCardId);
-    rewriteCardId = null;
+    clearRewriteResults();
+    groups.full.confirm = null;
     rewriteNotice('');
     rerender();
     updateUndo();
